@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kamailio NOC — Voice Core Monitoring</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="sev-dot" id="gdot"></span>
+    <div>
+      <h1>VOICE CORE NOC <span class="tag">SIP PROXY</span></h1>
+      <p><span id="node">—</span> · <span id="harole">—</span> · <span id="site">—</span></p>
+    </div>
+  </div>
+  <div class="alarmcount" title="Alarmas activas">
+    <div class="ac crit"><b id="nCrit">0</b><span>CRÍTICAS</span></div>
+    <div class="ac maj"><b id="nMaj">0</b><span>MAYORES</span></div>
+    <div class="ac min"><b id="nMin">0</b><span>MENORES</span></div>
+  </div>
+  <div class="topmeta">
+    <span id="gstatus" class="pill">cargando…</span>
+    <div class="clocks"><span id="clock">—</span><small id="clockUtc">—</small></div>
+    <div class="seg" id="range" role="group" aria-label="Rango histórico">
+      <button data-m="15">15m</button><button data-m="60" class="on">1h</button>
+      <button data-m="360">6h</button><button data-m="1440">24h</button>
+    </div>
+    <a href="logout" class="logout">Salir</a>
+  </div>
+</header>
+
+<section class="alarms" id="alarmPanel">
+  <div class="sect-h"><h2>Alarmas activas</h2><span class="hint" id="alarmHint"></span></div>
+  <table class="alarmtbl"><thead><tr><th>Sev.</th><th>Desde</th><th>Duración</th><th>Descripción</th></tr></thead><tbody id="alarms"></tbody></table>
+</section>
+
+<section class="sect">
+  <div class="sect-h"><h2>KPIs de servicio de voz</h2><span class="hint">ventana deslizante 5 min · umbrales estilo carrier</span></div>
+  <div class="hero" id="hero"></div>
+</section>
+
+<section class="sect">
+  <div class="sect-h"><h2>Elementos de red</h2><span class="hint">healthcheck activo cada 2 s</span></div>
+  <div class="ne" id="ne"></div>
+</section>
+
+<section class="sect">
+  <div class="sect-h"><h2>Tráfico y calidad</h2><span class="hint">pase el cursor sobre las gráficas para ver valores</span></div>
+  <div class="charts">
+    <div class="card chart" data-chart="calls"></div>
+    <div class="card chart" data-chart="regs"></div>
+    <div class="card chart" data-chart="cps"></div>
+    <div class="card chart" data-chart="asr"></div>
+    <div class="card chart" data-chart="pdd"></div>
+    <div class="card chart" data-chart="mos"></div>
+    <div class="card chart" data-chart="invrep"></div>
+    <div class="card chart" data-chart="sig"></div>
+    <div class="card chart" data-chart="sec"></div>
+    <div class="card chart" data-chart="hw"></div>
+  </div>
+</section>
+
+<section class="sect">
+  <div class="sect-h"><h2>Calidad por llamada</h2><span class="hint">MOS, jitter, pérdida y RTT por llamada desde RTCP · peor pierna</span></div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Llamadas activas — peor calidad <span class="hint" id="worstHint"></span></h3>
+      <div class="tscroll"><table class="tbl"><thead><tr><th>Call-ID</th><th>Remoto</th><th>Códec</th><th>Duración</th><th>MOS</th><th>MOS mín</th><th>Jitter</th><th>Pérdida</th><th>RTT</th></tr></thead><tbody id="worstAct"></tbody></table></div>
+    </div>
+    <div class="card">
+      <div class="ch2"><h3>Llamadas finalizadas</h3>
+        <div class="seg small" id="callsMode"><button data-v="recent" class="on">Recientes</button><button data-v="worst">Peor MOS</button><button data-v="bad">Solo bajo umbral</button></div></div>
+      <div class="ruta" id="doneHint"></div>
+      <div class="tscroll"><table class="tbl"><thead><tr><th>Fin</th><th>Call-ID</th><th>Remoto</th><th>Duración</th><th>MOS</th><th>MOS mín</th><th>Jitter</th><th>Pérdida</th><th>RTT</th></tr></thead><tbody id="doneCalls"></tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<section class="sect">
+  <div class="sect-h"><h2>Plataforma</h2><span class="hint" id="platHint"></span></div>
+  <div class="kpis" id="kpis"></div>
+  <div class="grid3">
+    <div class="card">
+      <h3>Healthcheck del proxy</h3>
+      <table class="tbl" id="health"></table>
+      <div class="ruta">SIP OPTIONS real cada 2 s · <span id="rtt"></span></div>
+    </div>
+    <div class="card">
+      <h3>Alta disponibilidad <span class="hint">DMQ + VIP</span></h3>
+      <table class="tbl" id="hatable"><thead><tr><th>Peer DMQ</th><th>Estado</th><th>Rol</th></tr></thead><tbody></tbody></table>
+      <div class="ruta" id="hainfo"></div>
+    </div>
+    <div class="card">
+      <h3>RTPEngine <span class="hint">media proxy</span></h3>
+      <table class="tbl" id="rtptable"></table>
+      <div class="ruta" id="rtpinfo"></div>
+    </div>
+    <div class="card">
+      <h3>Destinos dispatcher</h3>
+      <table class="tbl" id="dsptable"><thead><tr><th>Set</th><th>Destino</th><th>Flags</th><th>Estado</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h3>Códigos SIP enviados <span class="hint">sl.stats acumulado</span></h3>
+      <table class="tbl" id="codes"><thead><tr><th>Código</th><th>Total</th></tr></thead><tbody></tbody></table>
+      <div class="ruta" id="sysinfo"></div>
+    </div>
+    <div class="card">
+      <h3>Discos · Red · Sistema</h3>
+      <table class="tbl" id="hwtable"><thead><tr><th>Recurso</th><th>Valor</th></tr></thead><tbody></tbody></table>
+      <div class="ruta" id="hwinfo"></div>
+    </div>
+  </div>
+</section>
+
+<footer>Kamailio NOC · fuentes: <code>kamcmd stats</code> · <code>dlg.stats_active</code> · usrloc · OPTIONS activo · MySQL location · RTPEngine · refresco 2 s ·
+ASR = llamadas contestadas / intentos (dialog) · NER = 1 − fallos 5xx / intentos · ACD estimado por Ley de Little (llamadas activas ÷ contestadas/s) ·
+PDD = INVITE inicial (o el reintento con credenciales tras 401/407) → primer 180/183/2xx, medido por captura pasiva UDP 5060/5070 ·
+MOS por llamada = RTCP reportado por RTPEngine (NG query), peor pierna; sin RTCP no hay MOS</footer>
+<div id="tip" class="tip" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

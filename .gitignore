@@ -1,0 +1,7 @@
+# Nunca versionar datos/credenciales de un sitio
+noc.conf.json
+users.json
+noc_history.db*
+.noc-*
+__pycache__/
+*.pyc

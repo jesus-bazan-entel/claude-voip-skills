@@ -1,0 +1,12 @@
+{
+  "name": "claude-voip-skills",
+  "owner": { "name": "jesus-bazan-entel" },
+  "metadata": { "description": "Skills de Claude Code para operación de plataformas VoIP (Kamailio, RTPEngine, FreeSWITCH)." },
+  "plugins": [
+    {
+      "name": "kamailio-noc",
+      "source": "./plugins/kamailio-noc",
+      "description": "Despliega un NOC carrier-class en un proxy Kamailio (KPIs, PDD, MOS por llamada, alarmas)."
+    }
+  ]
+}

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kamailio NOC — Acceso corporativo</title>
+<link rel="stylesheet" href="style.css">
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font:14px/1.5 system-ui,Segoe UI,Roboto,Arial;color:#dbe7ff;
+ background:#070d1a;overflow-x:hidden}
+.bg{position:fixed;inset:0;z-index:0;pointer-events:none;
+ background:
+  radial-gradient(900px 500px at 15% -5%, rgba(56,189,248,.14), transparent 60%),
+  radial-gradient(800px 500px at 90% 110%, rgba(34,197,94,.10), transparent 60%),
+  radial-gradient(600px 400px at 70% 20%, rgba(167,139,250,.08), transparent 60%);}
+.grid{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.5;
+ background-image:linear-gradient(rgba(56,130,246,.07) 1px,transparent 1px),
+  linear-gradient(90deg,rgba(56,130,246,.07) 1px,transparent 1px);
+ background-size:44px 44px;
+ mask-image:radial-gradient(ellipse 90% 80% at 50% 40%,#000 30%,transparent 75%);}
+.wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
+.brandline{display:flex;align-items:center;gap:10px;color:#8aa0c6;font-size:12px;letter-spacing:3px;text-transform:uppercase}
+.brandline .pulse{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 10px #22c55e;animation:pl 2s infinite}
+@keyframes pl{50%{opacity:.4}}
+.card{width:400px;max-width:100%;background:rgba(17,28,51,.82);backdrop-filter:blur(14px);
+ border:1px solid #2a3f6d;border-radius:18px;padding:34px 34px 26px;
+ box-shadow:0 24px 70px rgba(0,0,0,.55),0 0 0 1px rgba(56,189,248,.06),0 0 44px rgba(56,189,248,.07)}
+.logo{display:flex;align-items:center;gap:13px;margin-bottom:6px}
+.logo svg{flex:none;filter:drop-shadow(0 0 8px rgba(56,189,248,.6))}
+.logo h1{margin:0;font-size:21px;letter-spacing:3px}
+.logo p{margin:1px 0 0;color:#8aa0c6;font-size:11.5px;letter-spacing:1.4px;text-transform:uppercase}
+.statusbar{display:flex;align-items:center;gap:8px;margin:16px 0 4px;padding:8px 12px;border-radius:9px;
+ background:#0a1122;border:1px solid #22345c;font-size:12px;color:#8aa0c6}
+.statusbar .d{width:8px;height:8px;border-radius:50%;background:#f59e0b}
+.statusbar b{color:#dbe7ff;letter-spacing:.6px}
+.err{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.5);border-left:4px solid #ef4444;
+ padding:9px 12px;border-radius:8px;font-size:13px;margin:12px 0 0;color:#fecaca}
+label{display:block;color:#8aa0c6;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;margin:14px 0 6px}
+.field{position:relative}
+.field svg{position:absolute;left:11px;top:50%;transform:translateY(-50%);opacity:.55}
+.field input{width:100%;padding:11px 40px 11px 36px;border-radius:10px;border:1px solid #2a3f6d;
+ background:#0a1122;color:#dbe7ff;font-size:14px;outline:none;transition:.15s}
+.field input:focus{border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.18)}
+.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:0;color:#8aa0c6;
+ cursor:pointer;padding:6px;border-radius:6px}.eye:hover{color:#dbe7ff}
+button.go{width:100%;margin-top:20px;padding:12px;border:0;border-radius:10px;cursor:pointer;
+ font-weight:800;font-size:14px;letter-spacing:1.6px;color:#04121c;
+ background:linear-gradient(135deg,#38bdf8,#22c55e);box-shadow:0 8px 24px rgba(56,189,248,.35);transition:.15s}
+button.go:hover{filter:brightness(1.1);box-shadow:0 8px 30px rgba(56,189,248,.5)}
+.meta{display:flex;justify-content:space-between;margin-top:14px;color:#5b7195;font-size:11px}
+.foot{color:#5b7195;font-size:11.5px;text-align:center;letter-spacing:.4px}
+.foot b{color:#8aa0c6}
+</style>
+</head>
+<body>
+<div class="bg"></div><div class="grid"></div>
+<div class="wrap">
+  <div class="brandline"><span class="pulse"></span>Network Operations · Carrier Class</div>
+  <form class="card" method="post" action="login" autocomplete="off">
+    <div class="logo">
+      <svg width="42" height="42" viewBox="0 0 42 42" fill="none">
+        <circle cx="21" cy="21" r="20" stroke="#38bdf8" stroke-width="2" opacity=".5"/>
+        <path d="M10 24a11 11 0 0 1 22 0" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+        <path d="M14.5 24a6.5 6.5 0 0 1 13 0" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/>
+        <circle cx="21" cy="24" r="2.6" fill="#38bdf8"/>
+        <path d="M13 31h16" stroke="#8aa0c6" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <div><h1>KAMAILIO NOC</h1><p>Proxy SIP · Health &amp; Traffic</p></div>
+    </div>
+    <div class="statusbar"><span class="d" id="hdot"></span><span>Proxy&nbsp;<b id="hstat">verificando…</b></span><span id="hclock" style="margin-left:auto"></span></div>
+    <!--ERROR-->
+    <label for="user">Usuario corporativo</label>
+    <div class="field">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5" r="3" stroke="#8aa0c6" stroke-width="1.5"/><path d="M2.5 14a5.5 5.5 0 0 1 11 0" stroke="#8aa0c6" stroke-width="1.5"/></svg>
+      <input id="user" name="user" required autofocus maxlength="64" placeholder="ej. noc" autocapitalize="off">
+    </div>
+    <label for="password">Clave de acceso</label>
+    <div class="field">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="3" y="7" width="10" height="7" rx="1.5" stroke="#8aa0c6" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="#8aa0c6" stroke-width="1.5"/></svg>
+      <input id="password" name="password" type="password" required maxlength="256" placeholder="••••••••••">
+      <button type="button" class="eye" id="eye" title="Mostrar / ocultar">👁</button>
+    </div>
+    <button class="go" type="submit">INICIAR SESIÓN</button>
+    <div class="meta"><span>Sesión 8 h</span><span>Bloqueo tras 5 intentos</span><span>Canal HTTPS</span></div>
+  </form>
+  <div class="foot">Acceso restringido a personal autorizado · <b>v1.0</b><br>Toda actividad queda registrada.</div>
+</div>
+<script>
+document.getElementById('eye').onclick = () => {
+  const p = document.getElementById('password');
+  p.type = p.type === 'password' ? 'text' : 'password';
+};
+fetch('api/healthz').then(r => r.json()).then(h => {
+  const ok = h.status === 'up';
+  document.getElementById('hdot').style.background = ok ? '#22c55e' : '#ef4444';
+  document.getElementById('hdot').style.boxShadow = ok ? '0 0 8px #22c55e' : '0 0 8px #ef4444';
+  document.getElementById('hstat').textContent = ok ? 'OPERATIVO' : 'FUERA DE SERVICIO';
+}).catch(() => { document.getElementById('hstat').textContent = 'SIN DATOS'; });
+</script>
+</body>
+</html>

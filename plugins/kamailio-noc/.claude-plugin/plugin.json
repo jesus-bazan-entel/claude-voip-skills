@@ -1,0 +1,8 @@
+{
+  "name": "kamailio-noc",
+  "version": "1.0.0",
+  "description": "Dashboard NOC carrier-class para proxies Kamailio: KPIs de voz (ASR, NER, CPS, ACD, PDD, MOS por llamada), alarmas, HA y RTPEngine.",
+  "author": { "name": "jesus-bazan-entel" },
+  "repository": "https://github.com/jesus-bazan-entel/claude-voip-skills",
+  "keywords": ["kamailio", "voip", "sip", "noc", "monitoring", "rtpengine"]
+}

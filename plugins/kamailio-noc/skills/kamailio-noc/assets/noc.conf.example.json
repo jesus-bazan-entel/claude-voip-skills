@@ -1,0 +1,14 @@
+{
+  "site_name": "operador.example",
+  "sip_domain": "sip.operador.example",
+  "sip_targets": [["192.0.2.10", 5060], ["192.0.2.10", 5070]],
+  "kamailio_http": "http://127.0.0.1:8080",
+  "db": {"host": "192.0.2.50", "port": 3306, "user": "kamailio", "password": "CAMBIAR", "name": "kamailio"},
+  "ha": {"vip": "192.0.2.14", "keepalived_service": "keepalived"},
+  "core_ips": ["192.0.2.40"],
+  "dispatcher_ignore_sets": [],
+  "rtpengine": {"ng": "127.0.0.1:2223", "service": "rtpengine-daemon", "kernel_table": 0},
+  "pdd": {"enabled": true, "bpf": "udp and (port 5060 or port 5070)"},
+  "mos_bad": 3.6,
+  "listen_port": 8899
+}

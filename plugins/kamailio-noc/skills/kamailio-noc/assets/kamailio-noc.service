@@ -1,0 +1,15 @@
+[Unit]
+Description=Kamailio NOC - healthcheck y monitoreo carrier-grade
+After=network.target kamailio.service
+Wants=kamailio.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__NOC_DIR__
+ExecStart=/usr/bin/python3 __NOC_DIR__/app.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

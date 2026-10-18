@@ -21,7 +21,7 @@ con `kamcmd`, captura pasiva y el socket NG de RTPEngine.
 | `scripts/discover.py` | autodescubre la config del proxy (solo lectura) |
 | `scripts/install.sh` | instala/actualiza (idempotente, no pisa config/usuarios/histórico) |
 | `scripts/smoke_test.py` | verifica API, KPIs y sondas con una sesión temporal |
-| `references/kpis.md` | fórmulas, fuentes y umbrales de cada KPI y alarma |
+| `references/kpis.md` | fórmulas, fuentes y umbrales de cada KPI, línea base, sonda SIP y alarmas |
 | `references/config.md` | cada clave de `noc.conf.json` y cómo degradar |
 | `references/kamailio-xhttp.md` | snippet opcional `/healthz` `/readyz` `/metrics` |
 | `references/troubleshooting.md` | fallos conocidos y su causa |
@@ -83,3 +83,14 @@ Ejecutar en el proxy destino (root). Rutas relativas al directorio de este skill
 - MOS: solo existe para llamadas con RTCP (~70% típico). Mostrar "sin RTCP", no 0.
 - PDD con 401/407: medir desde el INVITE con credenciales (nuevo CSeq).
 - Sets dispatcher "muertos" de diseño alarman permanentemente → `dispatcher_ignore_sets`.
+  Los destinos `D*` (deshabilitados por config) ya se muestran en gris sin alarmar.
+- MOS de G.711 se satura en 4,3: mostrar % bajo umbral, cobertura RTCP y p95 de
+  jitter/pérdida/RTT, no solo el promedio.
+- NER que cuenta sólo 5xx da 100% con un destino que no responde: el NER carrier suma 408 sin
+  timbrar e INVITE sin respuesta.
+- Disponibilidad: calcular sobre las 24 h persistidas e informar la cobertura; no rotular "24h"
+  si la historia es más corta.
+- RSS de Kamailio cuenta la SHM ×N procesos (7 GB falsos con 144 procs): usar PSS.
+- Alarmas en el servidor (no en el navegador): sobreviven a recargas y cambios de turno.
+- Los 403 no implican ataque: en un despliegue real eran ~1.100 ONT con 1 usuario por IP (cuentas
+  restringidas en el registrar). Mirar Top usuarios/UA antes de bloquear IPs.

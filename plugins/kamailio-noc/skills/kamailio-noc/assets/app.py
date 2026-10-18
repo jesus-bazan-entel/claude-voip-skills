@@ -9,12 +9,16 @@ Endpoints:
   GET /api/snapshot          -> estado actual + rates/sec + health + alertas
   GET /api/history?minutes=N -> series para graficas (max 1440)
   GET /api/healthz           -> liveness simple para LB/K8s
+  GET /api/calls             -> calidad por llamada (MOS/jitter/perdida/RTT + origen/destino)
+  GET /api/alarms?hours=N    -> historial de alarmas (persistidas en sqlite)
+  POST /api/alarms/ack       -> reconocer alarma {"id": N} (JSON, requiere sesion)
 """
 import ctypes
 import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import secrets
 import socket
@@ -25,7 +29,7 @@ import sys
 import threading
 import time
 import urllib.request
-from collections import deque
+from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -61,6 +65,10 @@ DEFAULT_CONFIG = {
     "pdd": {"enabled": True, "bpf": "udp and (port 5060 or port 5070)"},
     "mos_bad": 3.6,
     "listen_port": 8899,
+    "baseline_sigma": 3.0,          # desviaciones bajo la linea base para alarmar (ASR/CPS)
+    # notificaciones de alarmas (vacio = deshabilitado)
+    "notify": {"telegram_token": "", "telegram_chat": "", "webhook_url": "",
+               "min_sev": "major", "delay_s": 30},
 }
 
 
@@ -157,6 +165,9 @@ EXTRA_COLS = [("early", "INTEGER"), ("cps", "REAL"), ("asr", "REAL"), ("ner", "R
               ("health_ok", "INTEGER"), ("pdd_out", "REAL"), ("pdd_out_p95", "REAL"),
               ("pdd_in", "REAL"), ("mos_act_avg", "REAL"), ("mos_act_min", "REAL"),
               ("mos_done_avg", "REAL"), ("mos_bad_pct", "REAL")]
+# columnas nuevas de call_quality: partes de la llamada vistas por la sonda SIP
+CALLQ_EXTRA = [("src_user", "TEXT"), ("dst_user", "TEXT"), ("sub", "TEXT"),
+               ("ua", "TEXT"), ("dir", "TEXT")]
 
 state = {
     "last": None,          # snapshot anterior (para rates)
@@ -471,32 +482,72 @@ def db_init():
         dur INTEGER, mos REAL, mos_low REAL, jitter REAL, loss REAL, rtt REAL,
         remote TEXT, codec TEXT, pkts INTEGER)""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_callq_ended ON call_quality(ended)")
+    con.execute("""CREATE TABLE IF NOT EXISTS alarms(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, sev TEXT, msg TEXT,
+        raised INTEGER, last_seen INTEGER, cleared INTEGER,
+        ack_by TEXT, ack_ts INTEGER, notified INTEGER DEFAULT 0)""")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_alarms_raised ON alarms(raised)")
+    con.execute("""CREATE TABLE IF NOT EXISTS kpi_5m(
+        ts INTEGER PRIMARY KEY, attempts INTEGER, asr REAL, ner REAL, cps REAL)""")
     have = {r[1] for r in con.execute("PRAGMA table_info(samples)")}
     for col, typ in EXTRA_COLS:
         if col not in have:
             con.execute(f"ALTER TABLE samples ADD COLUMN {col} {typ}")
+    have = {r[1] for r in con.execute("PRAGMA table_info(call_quality)")}
+    for col, typ in CALLQ_EXTRA:
+        if col not in have:
+            con.execute(f"ALTER TABLE call_quality ADD COLUMN {col} {typ}")
+    if not con.execute("SELECT 1 FROM kpi_5m LIMIT 1").fetchone():
+        # linea base inicial: agregar el historico de muestras a cubetas de 5 min
+        con.execute("""INSERT OR IGNORE INTO kpi_5m
+            SELECT (ts/300)*300, CAST(AVG(cps)*300 AS INTEGER), AVG(asr), AVG(ner), AVG(cps)
+            FROM samples WHERE cps IS NOT NULL GROUP BY ts/300""")
     con.commit()
     con.close()
 
 
-# ---------- PDD: captura pasiva SIP (AF_PACKET + BPF en kernel) ----------
-# PDD = INVITE inicial -> primer 180/183 (o 2xx sin ringback). Se mide en el cable,
-# sin tocar kamailio.cfg. Solo UDP (no hay SIP/TCP activo). Si el INVITE es
-# desafiado (401/407), se mide desde el INVITE con credenciales (nuevo CSeq).
+# ---------- sonda SIP pasiva (AF_PACKET + BPF en kernel) ----------
+# Una sola captura alimenta varios KPIs sin tocar kamailio.cfg (solo UDP):
+#  - PDD = INVITE inicial -> primer 180/183 (o 2xx sin ringback). Si el INVITE es
+#    desafiado (401/407), se mide desde el INVITE con credenciales (nuevo CSeq).
+#  - Respuesta final de cada INVITE (486/487/404/480/408/5xx...) y NER carrier.
+#  - ACD exacto: 2xx -> BYE por Call-ID.
+#  - Partes de la llamada (From / R-URI / abonado / User-Agent) para las tablas MOS.
+#  - 403 enviados por el proxy: IP destino, usuario, metodo y UA del ofensor.
 PDD_CORE_IPS = set(CFG["core_ips"])   # INVITE desde el core = entrante
 PDD_BPF = CFG["pdd"].get("bpf") or "udp and (port 5060 or port 5070)"
 PDD_TIMER_B = 32                # s sin respuesta alguna = INVITE sin respuesta
+RING_MAX = 600                  # s timbrando sin respuesta final -> se descarta
+META_MAX_AGE = 6 * 3600         # s, partes de llamada sin BYE
 pdd = {"res": deque(maxlen=20000), "noresp": deque(maxlen=5000), "pend": {},
-       "status": "init", "error": "", "pkts": 0}
-_PDD_HDR = re.compile(r"^(call-id|i|cseq|to|t)\s*:\s*(.*)$", re.I | re.M)
+       "final": deque(maxlen=50000), "acd": deque(maxlen=20000),
+       "status": "init", "error": "", "pkts": 0, "since": None}
+sip_meta = {}                   # call-id -> partes de la llamada
+sec = {"r403": deque(maxlen=200000), "ua": {}}  # (ts, ip, user, metodo); ip ofensora -> UA
+_PDD_HDR = re.compile(r"^(call-id|i|cseq|to|t|from|f|user-agent|server)\s*:\s*(.*)$", re.I | re.M)
+_UA_HDR = re.compile(rb"^user-agent\s*:\s*([^\r\n]*)", re.I | re.M)
+_URI_USER = re.compile(r"sips?:([^@;>\s]+)@", re.I)
+
+
+def _local_ips():
+    out = run(["ip", "-o", "-4", "addr", "show"], timeout=3)
+    return {m.split("/")[0] for m in re.findall(r"inet (\S+)", out)}
+
+
+LOCAL_IPS = _local_ips()
 
 
 def _pdd_hdrs(payload):
     h = {}
     for k, v in _PDD_HDR.findall(payload.split(b"\r\n\r\n", 1)[0].decode("latin-1")):
-        k = {"i": "call-id", "t": "to"}.get(k.lower(), k.lower())
+        k = {"i": "call-id", "t": "to", "f": "from"}.get(k.lower(), k.lower())
         h.setdefault(k, v.strip())
     return h
+
+
+def _uri_user(s):
+    m = _URI_USER.search(s or "")
+    return m.group(1)[:64] if m else ""
 
 
 def _pdd_socket():
@@ -519,74 +570,252 @@ def pdd_loop():
         try:
             sock, _buf = _pdd_socket()
             pdd["status"], pdd["error"] = "running", ""
+            pdd["since"] = pdd["since"] or time.time()
             _pdd_capture(sock)
         except Exception as e:
             pdd["status"], pdd["error"] = "error", str(e)[:200]
             time.sleep(10)
 
 
+def _pdd_gc(now):
+    pend = pdd["pend"]
+    for cid, p in list(pend.items()):
+        age = now - p["t0"]
+        if p["done"]:
+            if now - p["tdone"] > PDD_TIMER_B:  # se conserva para ignorar retransmisiones
+                del pend[cid]
+        elif not p["resp"] and age > PDD_TIMER_B:
+            del pend[cid]
+            pdd["noresp"].append((now, p["dir"]))
+            m = sip_meta.get(cid)
+            if m:
+                m["end"] = now
+        elif (p["resp"] and not p["rang"] and age > PDD_TIMER_B) or age > RING_MAX:
+            del pend[cid]  # 401/407 sin reintento, o timbrado eterno
+    for cid, m in list(sip_meta.items()):
+        if (m.get("end") and now - m["end"] > 180) or now - m["t0"] > META_MAX_AGE or \
+                (not m.get("ans") and cid not in pend and now - m["t0"] > 120):
+            del sip_meta[cid]
+    if len(sec["ua"]) > 50000:  # solo ofensores con 403 en la ultima hora
+        keep = {r[1] for r in list(sec["r403"]) if now - r[0] <= 3600}
+        sec["ua"] = {ip: ua for ip, ua in sec["ua"].items() if ip in keep}
+
+
+def _on_invite(pl, src, now):
+    h = _pdd_hdrs(pl)
+    cid, cseq = h.get("call-id"), h.get("cseq", "")
+    if not cid or ";tag=" in h.get("to", "").replace(" ", ""):
+        return  # re-INVITE dentro de dialogo
+    pend = pdd["pend"]
+    p = pend.get(cid)
+    if p is None:
+        d = "in" if src in PDD_CORE_IPS else "out"
+        pend[cid] = {"t0": now, "cseq": cseq, "dir": d, "done": False, "resp": False,
+                     "rang": False, "tdone": 0}
+        if cid not in sip_meta:
+            frm = _uri_user(h.get("from"))
+            dst = _uri_user(pl[:pl.find(b"\r\n")].decode("latin-1")) or _uri_user(h.get("to"))
+            sip_meta[cid] = {"t0": now, "dir": d, "from": frm, "to": dst,
+                             "sub": frm if d == "out" else dst,
+                             "ua": (h.get("user-agent") or "")[:80] if d == "out" else "",
+                             "ip": src if d == "out" else "", "ans": None, "end": None}
+    elif p["cseq"] != cseq and not p["done"]:
+        p["t0"], p["cseq"], p["resp"] = now, cseq, False  # reintento con credenciales
+
+
+def _on_reply(pl, src, dst, now):
+    code = pl[8:11]
+    if code == b"100":
+        return
+    if code == b"403" and src in LOCAL_IPS:
+        h = _pdd_hdrs(pl)
+        meth = h.get("cseq", "").split()
+        sec["r403"].append((now, dst, _uri_user(h.get("from")), meth[-1] if meth else "?"))
+        sec["ua"].setdefault(dst, "")
+    if b"INVITE" not in pl[:2000]:
+        return
+    h = _pdd_hdrs(pl)
+    cid = h.get("call-id")
+    p = pdd["pend"].get(cid)
+    if not p or p["done"] or h.get("cseq") != p["cseq"]:
+        return
+    try:
+        c = int(code)
+    except ValueError:
+        return
+    p["resp"] = True
+    m = sip_meta.get(cid)
+    if c in (180, 183) or 200 <= c < 300:
+        if not p["rang"]:
+            p["rang"] = True
+            pdd["res"].append((now, now - p["t0"], p["dir"]))
+        if m and m["dir"] == "in" and not m["ua"] and src not in LOCAL_IPS and src not in PDD_CORE_IPS:
+            m["ua"] = (h.get("user-agent") or h.get("server") or "")[:80]  # ONT / softphone
+            m["ip"] = src
+    if c < 200 or c in (401, 407):
+        return
+    p["done"], p["tdone"] = True, now
+    pdd["final"].append((now, c, p["dir"], p["rang"]))
+    if m:
+        if c < 300:
+            m["ans"] = now
+        else:
+            m["end"] = now
+
+
+def _on_bye(pl, now):
+    m = sip_meta.get(_pdd_hdrs(pl).get("call-id"))
+    if m and m["ans"] and not m["end"]:
+        m["end"] = now
+        pdd["acd"].append((now, now - m["ans"], m["dir"]))
+
+
 def _pdd_capture(sock):
-    pend, last_gc = pdd["pend"], time.time()
+    last_gc = time.time()
     while True:
         try:
             fr = sock.recv(65535)
         except socket.timeout:
             fr = b""
         now = time.time()
-        if now - last_gc > 5:  # vencidos: sin respuesta alguna tras Timer B
+        if now - last_gc > 5:
             last_gc = now
-            for cid in [c for c, p in pend.items() if now - p["t0"] > PDD_TIMER_B]:
-                p = pend.pop(cid)
-                if not p["done"] and not p["resp"]:
-                    pdd["noresp"].append((now, p["dir"]))
+            _pdd_gc(now)
         if len(fr) < 42 or fr[12:14] != b"\x08\x00":
             continue
         pdd["pkts"] += 1
         ihl = (fr[14] & 15) * 4
         pl = fr[14 + ihl + 8:]
+        src = socket.inet_ntoa(fr[26:30])
+        if pl.startswith(b"SIP/2.0 "):
+            _on_reply(pl, src, socket.inet_ntoa(fr[30:34]), now)
+            continue
         if pl.startswith(b"INVITE "):
-            h = _pdd_hdrs(pl)
-            cid, cseq = h.get("call-id"), h.get("cseq", "")
-            if not cid or ";tag=" in h.get("to", "").replace(" ", ""):
-                continue  # re-INVITE dentro de dialogo
-            p = pend.get(cid)
-            if p is None:
-                src = socket.inet_ntoa(fr[26:30])
-                pend[cid] = {"t0": now, "cseq": cseq, "dir": "in" if src in PDD_CORE_IPS else "out",
-                             "done": False, "resp": False}
-            elif p["cseq"] != cseq and not p["done"]:
-                p["t0"], p["cseq"], p["resp"] = now, cseq, False  # reintento con credenciales
-        elif pl.startswith(b"SIP/2.0 ") and b"INVITE" in pl[:2000]:
-            code = pl[8:11]
-            if code == b"100":
-                continue
-            h = _pdd_hdrs(pl)
-            p = pend.get(h.get("call-id"))
-            if not p or p["done"] or h.get("cseq") != p["cseq"]:
-                continue
-            p["resp"] = True
-            if code in (b"180", b"183") or code[:1] == b"2":
-                p["done"] = True
-                pdd["res"].append((now, now - p["t0"], p["dir"]))
-            elif code not in (b"401", b"407"):
-                p["done"] = True  # fallo final antes de timbrar: sin PDD
+            _on_invite(pl, src, now)
+        elif pl.startswith(b"BYE "):
+            _on_bye(pl, now)
+        if src in sec["ua"]:  # UA del ofensor (solo IPs que ya recibieron 403)
+            mu = _UA_HDR.search(pl.split(b"\r\n\r\n", 1)[0])
+            if mu:
+                sec["ua"][src] = mu.group(1).decode("latin-1").strip()[:80]
+
+
+def _summ(v):
+    if not v:
+        return {"n": 0, "avg": None, "p50": None, "p95": None, "max": None}
+    v = sorted(v)
+    pct = lambda q: v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
+    return {"n": len(v), "avg": round(sum(v) / len(v), 3), "p50": round(pct(.5), 3),
+            "p95": round(pct(.95), 3), "max": round(v[-1], 3)}
 
 
 def pdd_stats(now, window=KPI_WINDOW):
-    def summ(v):
-        if not v:
-            return {"n": 0, "avg": None, "p50": None, "p95": None, "max": None}
-        v = sorted(v)
-        pct = lambda q: v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
-        return {"n": len(v), "avg": round(sum(v) / len(v), 3), "p50": round(pct(.5), 3),
-                "p95": round(pct(.95), 3), "max": round(v[-1], 3)}
     res = [r for r in list(pdd["res"]) if now - r[0] <= window]
     nr = [r for r in list(pdd["noresp"]) if now - r[0] <= window]
     return {"status": pdd["status"], "error": pdd["error"], "pending": len(pdd["pend"]),
-            "out": summ([r[1] for r in res if r[2] == "out"]),
-            "in": summ([r[1] for r in res if r[2] == "in"]),
+            "out": _summ([r[1] for r in res if r[2] == "out"]),
+            "in": _summ([r[1] for r in res if r[2] == "in"]),
             "noresp_out": sum(1 for r in nr if r[1] == "out"),
             "noresp_in": sum(1 for r in nr if r[1] == "in")}
+
+
+# Desglose de respuestas finales a INVITE (una por llamada, ultimo CSeq)
+OUTCOME_ORDER = ["2xx", "486", "487", "480", "404", "408", "403", "603", "4xx otros",
+                 "3xx", "5xx", "6xx otros", "sin respuesta"]
+
+
+def _outcome_cat(c):
+    if 200 <= c < 300:
+        return "2xx"
+    if str(c) in OUTCOME_ORDER:
+        return str(c)
+    return {3: "3xx", 4: "4xx otros", 5: "5xx", 6: "6xx otros"}.get(c // 100, "4xx otros")
+
+
+def outcome_stats(now, window=KPI_WINDOW):
+    """Categorias de respuesta final + NER carrier (5xx, 408 sin timbrar, sin respuesta)."""
+    fin = [r for r in list(pdd["final"]) if now - r[0] <= window]
+    nr = [r for r in list(pdd["noresp"]) if now - r[0] <= window]
+    cats = {k: [0, 0] for k in OUTCOME_ORDER}
+    net = {"5xx": 0, "408": 0, "noresp": len(nr)}
+    for _, c, d, rang in fin:
+        cats[_outcome_cat(c)][d == "in"] += 1
+        if 500 <= c < 600:
+            net["5xx"] += 1
+        elif c == 408 and not rang:  # 408 tras timbrar = no contesta (causa de usuario)
+            net["408"] += 1
+    for _, d in nr:
+        cats["sin respuesta"][d == "in"] += 1
+    total = len(fin) + len(nr)
+    nf = sum(net.values())
+    return {"window_s": window, "total": total, "net_fail": net,
+            "ner": round(100.0 * (1 - nf / total), 2) if total else None,
+            "cats": [{"k": k, "out": v[0], "in": v[1], "n": v[0] + v[1],
+                      "pct": round(100.0 * (v[0] + v[1]) / total, 1) if total else 0}
+                     for k, v in cats.items() if v[0] + v[1]]}
+
+
+def acd_stats(now, window=900):
+    """ACD exacto: duracion 2xx->BYE de las llamadas terminadas en la ventana."""
+    v = [r[1] for r in list(pdd["acd"]) if now - r[0] <= window]
+    s = _summ(v)
+    s["window_s"] = window
+    return s
+
+
+# Seguridad: top de 403 enviados por el proxy + IPs baneadas (htable ipban / fail2ban)
+_ban = {"ts": 0, "ipban": set(), "f2b": set(), "jails": []}
+_sec_cache = {"ts": 0, "out": None}
+
+
+def banned_ips(now):
+    if now - _ban["ts"] < 30:
+        return _ban
+    _ban["ts"] = now
+    _ban["ipban"] = set(re.findall(r"name:\s*(\S+)", run(["kamcmd", "htable.dump", "ipban"], timeout=4)))
+    jails = re.search(r"Jail list:\s*(.*)", run(["fail2ban-client", "status"], timeout=4))
+    _ban["jails"] = [j.strip() for j in jails.group(1).split(",") if j.strip()] if jails else []
+    f2b = set()
+    for j in _ban["jails"]:
+        m = re.search(r"Banned IP list:\s*(.*)", run(["fail2ban-client", "status", j], timeout=4))
+        if m:
+            f2b.update(m.group(1).split())
+    _ban["f2b"] = f2b
+    return _ban
+
+
+def security_stats(now, window=900, top=10):
+    if _sec_cache["out"] and now - _sec_cache["ts"] < 10:
+        return _sec_cache["out"]
+    rows = [r for r in list(sec["r403"]) if now - r[0] <= window]
+    ban = banned_ips(now)
+    uas = sec["ua"]
+    ips, users, agents, meths = Counter(), Counter(), Counter(), Counter()
+    ip_user, ip_meth = {}, {}
+    for _, ip, user, meth in rows:
+        ips[ip] += 1
+        meths[meth] += 1
+        agents[uas.get(ip) or "(sin UA)"] += 1
+        if user:
+            users[user] += 1
+            ip_user.setdefault(ip, Counter())[user] += 1
+        ip_meth.setdefault(ip, Counter())[meth] += 1
+
+    def bans(ip):
+        return [n for n, s in (("ipban", ban["ipban"]), ("fail2ban", ban["f2b"])) if ip in s]
+    n = len(rows)
+    span = min(window, now - (pdd["since"] or now)) or 1  # recien arrancada: ventana parcial
+    out = {"window_s": window, "span_s": int(span), "total": n, "rate": round(n / span, 2),
+           "unique_ips": len(ips), "methods": dict(meths.most_common()),
+           "ipban_n": len(ban["ipban"]), "f2b_n": len(ban["f2b"]), "f2b_jails": ban["jails"],
+           "top_ips": [{"ip": ip, "n": c, "pct": round(100.0 * c / n, 1), "ua": uas.get(ip, ""),
+                        "user": ip_user[ip].most_common(1)[0][0] if ip in ip_user else "",
+                        "users": len(ip_user.get(ip, ())), "meth": ip_meth[ip].most_common(1)[0][0],
+                        "ban": bans(ip)} for ip, c in ips.most_common(top)],
+           "top_uas": [{"ua": ua, "n": c, "pct": round(100.0 * c / n, 1)} for ua, c in agents.most_common(top)],
+           "top_users": [{"user": u, "n": c, "pct": round(100.0 * c / n, 1)} for u, c in users.most_common(top)]}
+    _sec_cache.update(ts=now, out=out)
+    return out
 
 
 # ---------- MOS por llamada: RTPEngine NG (bencode/UDP) ----------
@@ -703,14 +932,23 @@ def mos_loop():
                         continue  # sin media: llamada no establecida
                     m["end"] = int(m["seen"])
                     m["dur"] = int(m["seen"] - (m["created"] or m["seen"]))
+                    m.update(_parties(cid))
                     mos["done"].append(m)
                     rows.append((cid[:120], m["created"], m["end"], m["dur"], m["mos"], m["mos_low"],
-                                 m["jitter"], m["loss"], m["rtt"], m["remote"], m["codec"], m["pkts"]))
+                                 m["jitter"], m["loss"], m["rtt"], m["remote"], m["codec"], m["pkts"],
+                                 m["src_user"], m["dst_user"], m["sub"], m["ua"], m["dir"]))
                 db_callq_insert(rows)
             mos["status"], mos["error"] = "running", ""
         except Exception as e:
             mos["status"], mos["error"] = "error", str(e)[:200]
         time.sleep(MOS_POLL)
+
+
+def _parties(cid):
+    """Origen/destino/abonado/UA de la llamada segun la sonda SIP ('' si no se vio el INVITE)."""
+    m = sip_meta.get(cid) or {}
+    return {"src_user": m.get("from", ""), "dst_user": m.get("to", ""), "sub": m.get("sub", ""),
+            "ua": m.get("ua", ""), "dir": m.get("dir", "")}
 
 
 def db_callq_insert(rows):
@@ -719,7 +957,8 @@ def db_callq_insert(rows):
     try:
         con = sqlite3.connect(DB_PATH, timeout=5)
         con.executemany("INSERT INTO call_quality(call_id,created,ended,dur,mos,mos_low,jitter,"
-                        "loss,rtt,remote,codec,pkts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                        "loss,rtt,remote,codec,pkts,src_user,dst_user,sub,ua,dir) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         con.execute("DELETE FROM call_quality WHERE ended < ?",
                     (int(time.time()) - CALLQ_RETENTION_D * 86400,))
         con.commit()
@@ -730,16 +969,15 @@ def db_callq_insert(rows):
 
 def db_calls(minutes, only_bad, order, limit=200):
     minutes = max(1, min(CALLQ_RETENTION_D * 1440, minutes))
-    q = ("SELECT call_id,created,ended,dur,mos,mos_low,jitter,loss,rtt,remote,codec,pkts "
-         "FROM call_quality WHERE ended >= ?")
+    cols = ["call_id", "created", "ended", "dur", "mos", "mos_low", "jitter", "loss", "rtt",
+            "remote", "codec", "pkts", "src_user", "dst_user", "sub", "ua", "dir"]
+    q = f"SELECT {','.join(cols)} FROM call_quality WHERE ended >= ?"
     args = [int(time.time()) - minutes * 60]
     if only_bad:
         q += " AND mos IS NOT NULL AND mos < ?"
         args.append(MOS_BAD)
     q += " ORDER BY " + ("mos IS NULL, mos ASC" if order == "worst" else "ended DESC") + " LIMIT ?"
     args.append(limit)
-    cols = ["call_id", "created", "ended", "dur", "mos", "mos_low", "jitter", "loss", "rtt",
-            "remote", "codec", "pkts"]
     try:
         con = sqlite3.connect(DB_PATH, timeout=5)
         rows = con.execute(q, args).fetchall()
@@ -758,16 +996,22 @@ def mos_stats(now, window=900):
     done = [c for c in list(mos["done"]) if now - c["end"] <= window]
     dm = [c["mos"] for c in done if c["mos"] is not None]
     worst = sorted((c for c in act if c["mos"] is not None), key=lambda c: c["mos"])[:8]
+    # MOS satura en 4.3 con G.711: la distribucion de jitter/perdida/RTT dice mas
+    dist = {k: _summ([c[k] for c in done if c[k] is not None]) for k in ("jitter", "loss", "rtt")}
     return {"status": mos["status"], "error": mos["error"], "bad_threshold": MOS_BAD,
             "active": {"n": len(act), "n_mos": len(am), "avg": round(sum(am) / len(am), 2) if am else None,
-                       "min": min(am) if am else None, "bad": sum(1 for v in am if v < MOS_BAD)},
+                       "min": min(am) if am else None, "bad": sum(1 for v in am if v < MOS_BAD),
+                       "rtcp_pct": round(100.0 * len(am) / len(act), 1) if act else None},
             "done": {"n": len(done), "n_mos": len(dm), "avg": round(sum(dm) / len(dm), 2) if dm else None,
                      "bad": sum(1 for v in dm if v < MOS_BAD),
                      "bad_pct": round(100.0 * sum(1 for v in dm if v < MOS_BAD) / len(dm), 1) if dm else None,
+                     "rtcp_pct": round(100.0 * len(dm) / len(done), 1) if done else None,
+                     "jitter": dist["jitter"], "loss": dist["loss"], "rtt": dist["rtt"],
                      "window_s": window},
             "worst_active": [{"call_id": c["call_id"], "remote": c["remote"], "codec": c["codec"],
                               "dur": int(now - (c["created"] or now)), "mos": c["mos"], "mos_low": c["mos_low"],
-                              "jitter": c["jitter"], "loss": c["loss"], "rtt": c["rtt"]} for c in worst]}
+                              "jitter": c["jitter"], "loss": c["loss"], "rtt": c["rtt"],
+                              **_parties(c["call_id"])} for c in worst]}
 
 
 HIST_COLS = ["ts", "register_ps", "invite_ps", "total_ps", "bye_ps", "options_ps",
@@ -831,10 +1075,14 @@ def db_peaks():
         r = con.execute("SELECT ts FROM samples WHERE ts >= ? AND dialogs = ? ORDER BY ts DESC LIMIT 1",
                         (since, out["calls_24h"] or 0)).fetchone()
         out["calls_24h_ts"] = r[0] if r else None
+        # 24h reales del historico persistido (no se reinicia con kamailio ni con el NOC).
+        # Huecos sin muestras (NOC caido) no cuentan como disponibles: se informan como cobertura.
         r = con.execute("SELECT COUNT(*), SUM(health_ok), MIN(ts) FROM samples "
                         "WHERE ts >= ? AND health_ok IS NOT NULL", (since,)).fetchone()
         out["avail_24h"] = round(100.0 * r[1] / r[0], 3) if r[0] else None
         out["avail_since"] = r[2]
+        out["avail_cover_pct"] = round(min(100.0, 100.0 * r[0] * HIST_EVERY / 86400), 1) if r[0] else 0
+        out["avail_down_s"] = int((r[0] - (r[1] or 0)) * HIST_EVERY) if r[0] else None
         con.close()
     except Exception:
         pass
@@ -878,6 +1126,213 @@ def window_kpis(now, stats, calls, registered):
     if cl and max(cl) >= 20:
         kpi["calls_drop_pct"] = round(100.0 * (max(cl) - calls) / max(cl), 1)
     return kpi
+
+
+# ---------- linea base: misma hora de semanas (o dias) previos ----------
+BASE_SIGMA = float(CFG.get("baseline_sigma", 3.0))
+_kpi5 = {"bucket": 0}
+_base = {"ts": 0, "out": None}
+
+
+def kpi5m_record(now, kpi):
+    """Al cerrar cada cubeta de 5 min guarda el KPI de la ventana (que cubre esa cubeta)."""
+    b = int(now // 300) * 300
+    if _kpi5["bucket"] == b:
+        return
+    first, _kpi5["bucket"] = not _kpi5["bucket"], b
+    if first or kpi.get("window_s", 0) < 240:
+        return
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        con.execute("INSERT OR REPLACE INTO kpi_5m VALUES(?,?,?,?,?)",
+                    (b - 300, kpi.get("attempts"), kpi.get("asr"), kpi.get("ner"), kpi.get("cps")))
+        con.execute("DELETE FROM kpi_5m WHERE ts < ?", (b - 35 * 86400,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _mean_sd(v):
+    m = sum(v) / len(v)
+    return m, (sum((x - m) ** 2 for x in v) / max(1, len(v) - 1)) ** 0.5
+
+
+def kpi_baseline(now):
+    """ASR/CPS esperados a esta hora: +-30 min de la misma hora en las 4 semanas previas;
+    si aun no hay historia semanal, los 7 dias previos (mezcla dias habiles y fin de semana)."""
+    if now - _base["ts"] < 60:
+        return _base["out"]
+    out = None
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        for mode, step, ks in (("semanal", 7 * 86400, range(1, 5)), ("diaria", 86400, range(1, 8))):
+            rows = []
+            for k in ks:
+                c = now - k * step
+                rows += con.execute("SELECT asr, cps, attempts FROM kpi_5m WHERE ts BETWEEN ? AND ?",
+                                    (c - 1800, c + 1800)).fetchall()
+            asr = [r[0] for r in rows if r[0] is not None and (r[2] or 0) >= 20]
+            cps = [r[1] for r in rows if r[1] is not None]
+            if len(asr) >= 6 and len(cps) >= 6:
+                am, asd = _mean_sd(asr)
+                cm, csd = _mean_sd(cps)
+                # piso de sigma: evita alarmar por ruido cuando la historia es muy estable
+                out = {"mode": mode, "n": len(asr), "asr": round(am, 1), "asr_sd": round(max(asd, 2.0), 1),
+                       "cps": round(cm, 3), "cps_sd": round(max(csd, 0.1 * cm, 0.02), 3)}
+                break
+        con.close()
+    except Exception:
+        pass
+    _base.update(ts=now, out=out)
+    return out
+
+
+# ---------- alarmas persistentes (servidor) + notificaciones ----------
+SEV_RANK = {"minor": 1, "major": 2, "critical": 3}
+ALARM_CLEAR_S = 60        # s ausente antes de limpiar (histeresis anti-aleteo)
+ALARM_RESTORE_GRACE = 60  # s extra tras reiniciar el NOC antes de limpiar las restauradas
+NOTIFY = CFG.get("notify") or {}
+alarms = {"active": {}, "lock": threading.Lock(), "flush": 0}
+_notify_q = queue.Queue(maxsize=500)
+
+
+def alarm_key(msg):
+    return re.sub(r"[\d.,]+", "#", msg)
+
+
+def alarms_load():
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        rows = con.execute("SELECT id,key,sev,msg,raised,ack_by,ack_ts,notified FROM alarms "
+                           "WHERE cleared IS NULL").fetchall()
+        con.close()
+    except Exception:
+        rows = []
+    now = time.time()
+    for r in rows:
+        alarms["active"][r[1]] = {"id": r[0], "key": r[1], "sev": r[2], "msg": r[3], "raised": r[4],
+                                  "ack_by": r[5], "ack_ts": r[6], "notified": r[7] or 0,
+                                  "last_seen": now + ALARM_RESTORE_GRACE}
+
+
+def _notify(kind, a):
+    if not (NOTIFY.get("telegram_token") and NOTIFY.get("telegram_chat")) and not NOTIFY.get("webhook_url"):
+        return
+    try:
+        _notify_q.put_nowait((kind, dict(a), int(time.time())))
+    except queue.Full:
+        pass
+
+
+def notify_loop():
+    sevtxt = {"critical": "CRITICA", "major": "MAYOR", "minor": "MENOR"}
+    host = socket.gethostname()
+    while True:
+        kind, a, ts = _notify_q.get()
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        head = {"raise": "ALARMA", "escalate": "ALARMA ESCALADA", "clear": "LIMPIA"}[kind]
+        text = (f"[{head}] {sevtxt.get(a['sev'], a['sev'])} - {CFG['site_name'] or SIP_DOMAIN} ({host})\n"
+                f"{a['msg']}\nDesde {time.strftime('%H:%M:%S', time.localtime(a['raised']))}"
+                + (f" - limpia {when}" if kind == "clear" else ""))
+        try:
+            if NOTIFY.get("telegram_token") and NOTIFY.get("telegram_chat"):
+                body = json.dumps({"chat_id": NOTIFY["telegram_chat"], "text": text}).encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{NOTIFY['telegram_token']}/sendMessage", data=body,
+                    headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=10).read()
+            if NOTIFY.get("webhook_url"):
+                body = json.dumps({"event": kind, "id": a["id"], "severity": a["sev"], "message": a["msg"],
+                                   "raised": a["raised"], "ts": ts, "site": CFG["site_name"],
+                                   "host": host, "text": text}).encode()
+                req = urllib.request.Request(NOTIFY["webhook_url"], data=body,
+                                             headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=10).read()
+        except Exception as e:
+            print(f"[noc] notificacion fallida: {e}", flush=True)
+
+
+def alarms_update(alerts, now):
+    """Sincroniza las alertas calculadas con la tabla alarms (alta, escalado, limpieza)."""
+    min_rank = SEV_RANK.get(NOTIFY.get("min_sev", "major"), 2)
+    delay = float(NOTIFY.get("delay_s", 30))
+    act = alarms["active"]
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+    except Exception:
+        return
+    with alarms["lock"]:
+        seen = set()
+        for a in alerts:
+            k = alarm_key(a["msg"])
+            seen.add(k)
+            r = act.get(k)
+            if r is None:
+                cur = con.execute("INSERT INTO alarms(key,sev,msg,raised,last_seen) VALUES(?,?,?,?,?)",
+                                  (k, a["sev"], a["msg"], int(now), int(now)))
+                r = act[k] = {"id": cur.lastrowid, "key": k, "sev": a["sev"], "msg": a["msg"],
+                              "raised": int(now), "ack_by": None, "ack_ts": None, "notified": 0}
+            elif SEV_RANK[a["sev"]] > SEV_RANK[r["sev"]]:
+                r["sev"] = a["sev"]
+                if r["notified"] and SEV_RANK[a["sev"]] >= min_rank:
+                    _notify("escalate", {**r, "msg": a["msg"]})
+                r["ack_by"] = r["ack_ts"] = None  # escalado: requiere nuevo reconocimiento
+                con.execute("UPDATE alarms SET sev=?, ack_by=NULL, ack_ts=NULL WHERE id=?", (a["sev"], r["id"]))
+            r["msg"], r["last_seen"] = a["msg"], max(now, r.get("last_seen", 0))
+            if not r["notified"] and SEV_RANK[r["sev"]] >= min_rank and now - r["raised"] >= delay:
+                r["notified"] = 1
+                _notify("raise", r)
+                con.execute("UPDATE alarms SET notified=1 WHERE id=?", (r["id"],))
+        for k, r in list(act.items()):
+            if k not in seen and now - r["last_seen"] >= ALARM_CLEAR_S:
+                con.execute("UPDATE alarms SET cleared=?, last_seen=?, msg=? WHERE id=?",
+                            (int(now), int(min(now, r["last_seen"])), r["msg"], r["id"]))
+                del act[k]
+                if r["notified"]:
+                    _notify("clear", r)
+        if now - alarms["flush"] >= 30:  # persistir ultimo mensaje/visto de las activas
+            alarms["flush"] = now
+            con.executemany("UPDATE alarms SET last_seen=?, msg=? WHERE id=?",
+                            [(int(min(now, r["last_seen"])), r["msg"], r["id"]) for r in act.values()])
+            con.execute("DELETE FROM alarms WHERE cleared IS NOT NULL AND cleared < ?",
+                        (int(now) - 30 * 86400,))
+        con.commit()
+        con.close()
+        order = {"critical": 0, "major": 1, "minor": 2}
+        return sorted(({"id": r["id"], "sev": r["sev"], "msg": r["msg"], "raised": r["raised"],
+                        "ack_by": r["ack_by"], "ack_ts": r["ack_ts"], "present": k in seen}
+                       for k, r in act.items()), key=lambda r: (order[r["sev"]], r["raised"]))
+
+
+def alarm_ack(aid, user):
+    with alarms["lock"]:
+        r = next((r for r in alarms["active"].values() if r["id"] == aid), None)
+        if not r:
+            return False
+        r["ack_by"], r["ack_ts"] = user, int(time.time())
+        try:
+            con = sqlite3.connect(DB_PATH, timeout=5)
+            con.execute("UPDATE alarms SET ack_by=?, ack_ts=? WHERE id=?", (user, r["ack_ts"], aid))
+            con.commit()
+            con.close()
+        except Exception:
+            return False
+    return True
+
+
+def db_alarm_history(hours):
+    hours = max(1, min(24 * 30, hours))
+    since = int(time.time()) - hours * 3600
+    cols = ["id", "sev", "msg", "raised", "cleared", "ack_by", "ack_ts"]
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        rows = con.execute(f"SELECT {','.join(cols)} FROM alarms WHERE raised >= ? OR cleared >= ? "
+                           "OR cleared IS NULL ORDER BY raised DESC LIMIT 500", (since, since)).fetchall()
+        con.close()
+    except Exception:
+        rows = []
+    return {"cols": cols, "rows": rows}
 
 
 # ---------- alta disponibilidad: DMQ + VIP ----------
@@ -958,22 +1413,34 @@ def read_temps():
     return temps
 
 
-def read_kam_procs():
-    n, rss = 0, 0
-    try:
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
+_kmem = {"ts": 0, "out": {}}
+
+
+def read_kam_mem(now):
+    """Memoria real de kamailio. RSS suma la SHM mapeada en cada proceso (x144), por eso
+    se usa PSS (smaps_rollup) separando la parte compartida; PKG = pkg.stats real_used."""
+    if now - _kmem["ts"] < 30:
+        return _kmem["out"]
+    n, pss, pss_shm = 0, 0, 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if open(f"/proc/{pid}/comm").read().strip() != "kamailio":
                 continue
-            try:
-                if open(f"/proc/{pid}/comm").read().strip() != "kamailio":
-                    continue
-                n += 1
-                rss += int(open(f"/proc/{pid}/statm").read().split()[1]) * 4096
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return n, round(rss / 1048576, 1)
+            n += 1
+            for line in open(f"/proc/{pid}/smaps_rollup"):
+                if line.startswith("Pss:"):
+                    pss += int(line.split()[1])
+                elif line.startswith("Pss_Shmem:"):
+                    pss_shm += int(line.split()[1])
+        except Exception:
+            pass
+    pkg_used = sum(int(v) for v in re.findall(r"real_used:\s*(\d+)", run(["kamcmd", "pkg.stats"], timeout=5)))
+    out = {"procs": n, "pss_mb": round(pss / 1024, 1), "pss_shm_mb": round(pss_shm / 1024, 1),
+           "pss_priv_mb": round((pss - pss_shm) / 1024, 1), "pkg_used_mb": round(pkg_used / 1048576, 1)}
+    _kmem.update(ts=now, out=out)
+    return out
 
 
 def collect_system():
@@ -982,7 +1449,7 @@ def collect_system():
     now = time.time()
     sys = {"cpu_pct": 0.0, "load": [0, 0, 0], "mem": {}, "swap_pct": 0,
            "disks": [], "disk_max_pct": 0, "net": [], "net_rx": 0, "net_tx": 0,
-           "uptime_s": 0, "temps": [], "temp_max": None, "kam_procs": 0, "kam_rss_mb": 0}
+           "uptime_s": 0, "temps": [], "temp_max": None, "kam_procs": 0, "kam_mem": {}}
     try:
         sys["load"] = list(map(float, open("/proc/loadavg").read().split()[:3]))
     except Exception:
@@ -1056,7 +1523,8 @@ def collect_system():
     sys["temps"] = read_temps()
     if sys["temps"]:
         sys["temp_max"] = max(t["c"] for t in sys["temps"])
-    sys["kam_procs"], sys["kam_rss_mb"] = read_kam_procs()
+    sys["kam_mem"] = read_kam_mem(now)
+    sys["kam_procs"] = sys["kam_mem"].get("procs", 0)
     return sys
 
 
@@ -1143,8 +1611,8 @@ def collect_once():
     m2 = re.findall(r"(\w+):\s*(-?\d+)", shm_out)
     shm_d = dict(m2)
     try:
-        total = abs(int(shm_d.get("total", 0))) or 1
-        used = int(shm_d.get("used", 0))
+        total = abs(int(shm_d.get("total", 0))) or 1  # int32 desbordado en kamcmd con 2 GB
+        used = int(shm_d.get("real_used", shm_d.get("used", 0)))  # incluye fragmentacion
         shm_pct = round(100.0 * used / total, 2)
     except Exception:
         shm_pct, total, used = 0, 0, 0
@@ -1158,7 +1626,8 @@ def collect_once():
     dests = dispatcher_list()
     for d in dests:
         d["ignored"] = d.get("set") in DSP_IGNORE_SETS
-    live_dests = [d for d in dests if not d["ignored"]]
+        d["disabled"] = d.get("flags", "").startswith("D")  # DX = deshabilitado por config, sin sondeo
+    live_dests = [d for d in dests if not d["ignored"] and not d["disabled"]]
     if HEALTHZ_URL:
         hz_code, _ = http_get(HEALTHZ_URL, timeout=3)
         rz_code, _ = http_get(READYZ_URL, timeout=4)
@@ -1228,6 +1697,23 @@ def collect_once():
     kpi = window_kpis(now, stats, active_dialogs, state["reg_contacts"])
     kpi.update(db_peaks())
     pdd_info = pdd_stats(now)
+    outcomes = outcome_stats(now)
+    kpi["ner_src"] = "5xx"
+    if pdd_info["status"] == "running":
+        # NER carrier sobre respuestas finales capturadas (5xx + 408 sin timbrar + sin respuesta)
+        kpi.update(ner=outcomes["ner"], ner_n=outcomes["total"], ner_src="carrier")
+        acd = acd_stats(now)
+        kpi.update(acd=acd["avg"], acd_n=acd["n"], acd_p50=acd["p50"], acd_src="exacta")
+    else:
+        kpi.update(ner_n=kpi["attempts"], acd_src="estimada")
+    kpi5m_record(now, kpi)
+    base = kpi_baseline(now)
+    kpi["base"], kpi["base_sigma"] = base, BASE_SIGMA
+    if base:
+        if kpi.get("asr") is not None:
+            kpi["asr_z"] = round((kpi["asr"] - base["asr"]) / base["asr_sd"], 1)
+        if kpi.get("cps") is not None:
+            kpi["cps_z"] = round((kpi["cps"] - base["cps"]) / base["cps_sd"], 1)
     mos_info = mos_stats(now)
     if mos_info["status"] == "running":  # MOS NG reemplaza al promedio de logs
         rtpengine_info["mos_avg"] = mos_info["done"]["avg"] or mos_info["active"]["avg"]
@@ -1251,6 +1737,8 @@ def collect_once():
         "registered_db": state.get("reg_db"),
         "kpi": kpi,
         "pdd": pdd_info,
+        "outcomes": outcomes,
+        "security": security_stats(now),
         "mos": mos_info,
         "sip_rtt_max": max_rtt,
         "hostname": socket.gethostname(),
@@ -1258,6 +1746,7 @@ def collect_once():
         "dispatcher": dests,
         "dispatcher_up": sum(1 for d in live_dests if d.get("up")),
         "dispatcher_total": len(live_dests),
+        "dispatcher_disabled": sum(1 for d in dests if d["disabled"]),
         "health": {
             "kamailio": hz_code == 200,
             "metrics": True if stats else False,
@@ -1346,9 +1835,18 @@ def collect_once():
     if kpi.get("attempts", 0) >= 20:
         if kpi["asr"] is not None and kpi["asr"] < 30:
             alerts.append({"sev": "major", "msg": f"ASR bajo: {kpi['asr']}% (5 min, {kpi['attempts']} intentos)"})
-        if kpi["ner"] is not None and kpi["ner"] < 95:
-            alerts.append({"sev": "major" if kpi["ner"] < 90 else "minor",
-                           "msg": f"NER degradado: {kpi['ner']}% — fallos 5xx de red"})
+        elif kpi.get("asr_z") is not None and kpi["asr_z"] <= -BASE_SIGMA:
+            alerts.append({"sev": "major", "msg": f"ASR {kpi['asr']}% a {-kpi['asr_z']}σ bajo la base "
+                           f"{base['mode']} ({base['asr']}% ± {base['asr_sd']})"})
+    if base and base["cps"] >= 0.2 and kpi.get("cps_z") is not None and kpi["cps_z"] <= -BASE_SIGMA:
+        alerts.append({"sev": "major", "msg": f"Tráfico (CPS {kpi['cps']}) a {-kpi['cps_z']}σ bajo la base "
+                       f"{base['mode']} ({base['cps']} ± {base['cps_sd']})"})
+    if (kpi.get("ner_n") or 0) >= 20 and kpi["ner"] is not None and kpi["ner"] < 95:
+        nf = outcomes["net_fail"]
+        why = (f"5xx {nf['5xx']} · 408 {nf['408']} · sin respuesta {nf['noresp']}"
+               if kpi["ner_src"] == "carrier" else "fallos 5xx")
+        alerts.append({"sev": "major" if kpi["ner"] < 90 else "minor",
+                       "msg": f"NER degradado: {kpi['ner']}% — {why}"})
     po, pi = pdd_info["out"], pdd_info["in"]
     if pdd_info["status"] == "error":
         alerts.append({"sev": "minor", "msg": f"Medición PDD detenida: {pdd_info['error']}"})
@@ -1362,9 +1860,11 @@ def collect_once():
         alerts.append({"sev": "minor", "msg": f"INVITE sin respuesta (32 s): {pdd_info['noresp_out']} salientes, {pdd_info['noresp_in']} entrantes en 5 min"})
     if kpi.get("reg_ok_pct") is not None and kpi["reg_ok_pct"] < 95:
         alerts.append({"sev": "minor", "msg": f"Tasa de registro exitoso {kpi['reg_ok_pct']}%"})
-    snap["alerts"] = alerts
     snap["status"] = "critical" if any(a["sev"] == "critical" for a in alerts) else \
                      "major" if alerts else "ok"
+    snap["alerts"] = alarms_update(alerts, now)
+    if snap["alerts"] is None:  # sqlite no disponible: alertas del ciclo sin persistencia
+        snap["alerts"] = [{"id": None, "raised": int(now), "present": True, **a} for a in alerts]
 
     with state["lock"]:
         state["last"] = {"ts": now, "stats": dict(stats)}
@@ -1577,6 +2077,13 @@ class Handler(BaseHTTPRequestHandler):
                 minutes = 60
             return self.send_json(db_calls(minutes, q.get("bad", ["0"])[0] == "1",
                                            q.get("order", ["recent"])[0]))
+        if path == "/api/alarms":
+            q = parse_qs(u.query)
+            try:
+                hours = int(q.get("hours", ["24"])[0])
+            except ValueError:
+                hours = 24
+            return self.send_json(db_alarm_history(hours))
         if path == "/api/live":
             with state["lock"]:
                 pts = list(state["series"])[-120:]
@@ -1591,6 +2098,18 @@ class Handler(BaseHTTPRequestHandler):
             path = path[4:]
         if path == "/login":
             return self.do_login_post()
+        if path == "/api/alarms/ack":
+            user = get_session_user(parse_cookies(self).get(COOKIE_NAME, ""))
+            # JSON obligatorio: un formulario de otro sitio no puede enviarlo sin preflight CORS
+            if not user or not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self.send_json({"error": "login required"}, 401 if not user else 415)
+            try:
+                n = min(int(self.headers.get("Content-Length", "0")), 1024)
+                aid = int(json.loads(self.rfile.read(n) or b"{}").get("id"))
+            except Exception:
+                return self.send_json({"error": "bad request"}, 400)
+            ok = alarm_ack(aid, user)
+            return self.send_json({"ok": ok}, 200 if ok else 404)
         self.send_response(404)
         self.end_headers()
 
@@ -1609,12 +2128,14 @@ def main():
         print(f"OK: usuario '{user}' actualizado")
         return
     db_init()
+    alarms_load()
     ensure_bootstrap_user()
     # primera muestra rapida (sin rates aun)
     t = threading.Thread(target=collector_loop, daemon=True)
     t.start()
     threading.Thread(target=pdd_loop, daemon=True).start()
     threading.Thread(target=mos_loop, daemon=True).start()
+    threading.Thread(target=notify_loop, daemon=True).start()
     write_mycnf()
     port = int(os.environ.get("NOC_PORT", CFG.get("listen_port", 8899)))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)

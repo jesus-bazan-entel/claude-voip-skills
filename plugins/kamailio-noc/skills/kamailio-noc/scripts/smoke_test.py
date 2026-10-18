@@ -54,6 +54,19 @@ def main():
         pd, mo = s.get("pdd", {}), s.get("mos", {})
         print(f"PDD sonda={pd.get('status')} saliente={pd.get('out')} entrante={pd.get('in')}")
         print(f"MOS sonda={mo.get('status')} activas={mo.get('active')} finalizadas={mo.get('done')}")
+        oc, sc = s.get("outcomes") or {}, s.get("security") or {}
+        print(f"NER fuente={k.get('ner_src')} n={k.get('ner_n')}  ACD fuente={k.get('acd_src')} n={k.get('acd_n')}  "
+              f"base={k.get('base')}")
+        print(f"respuestas INVITE 5 min: {oc.get('total')} {[(c['k'], c['n']) for c in oc.get('cats', [])]}")
+        print(f"403: {sc.get('rate')}/s  IPs={sc.get('unique_ips')}  ipban={sc.get('ipban_n')}  "
+              f"fail2ban={sc.get('f2b_jails')}")
+        km = (s.get("system") or {}).get("kam_mem") or {}
+        print(f"kamailio memoria: PSS {km.get('pss_mb')} MB (SHM {km.get('pss_shm_mb')}) PKG {km.get('pkg_used_mb')} MB")
+        for key in ("outcomes", "security"):
+            if key not in s:
+                fails.append(f"snapshot sin '{key}' (app.py desactualizado)")
+        if pd.get("status") == "running" and k.get("ner_src") != "carrier":
+            fails.append("sonda SIP activa pero NER no usa respuestas capturadas")
         if pd.get("status") == "error":
             fails.append(f"sonda PDD: {pd.get('error')}")
         if mo.get("status") == "error":
@@ -63,7 +76,11 @@ def main():
         if s.get("early_dialogs", 0) > 10**9:
             fails.append("early_dialogs con underflow")
         for al in s.get("alerts", []):
-            print(f"  alarma {al['sev']}: {al['msg']}")
+            print(f"  alarma #{al.get('id')} {al['sev']}: {al['msg']}" + (f" (ack {al['ack_by']})" if al.get("ack_by") else ""))
+            if al.get("id") is None:
+                fails.append("alarmas sin id: la tabla alarms de sqlite no está disponible")
+        ah = json.loads(get("/api/alarms?hours=24")[1])
+        print(f"historial de alarmas 24 h: {len(ah.get('rows', []))}")
         hist = json.loads(get("/api/history?minutes=5")[1])
         if not hist.get("rows"):
             warns.append("histórico vacío (normal si el servicio arrancó hace <10 s)")

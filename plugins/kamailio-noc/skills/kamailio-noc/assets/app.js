@@ -41,11 +41,11 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 // ---------------- estado / series ----------------
 const SERIES = ['dialogs', 'early', 'registered', 'cps', 'asr', 'ner', 'acd', 'invite_ps',
   'inv_2xx_ps', 'inv_4xx_ps', 'inv_5xx_ps', 'total_ps', 'register_ps', 'options_ps',
-  'auth_401_ps', 'auth_403_ps', 'drop_ps', 'pdd_out', 'pdd_out_p95', 'pdd_in', 'mos_act_avg', 'mos_act_min'];
+  'auth_401_ps', 'auth_403_ps', 'drop_ps', 'pdd_out', 'pdd_out_p95', 'pdd_in', 'mos_act_avg', 'mos_act_min',
+  'mos_bad_pct'];
 const D = { t: [], hwt: [], cpu: [], mem: [], dsk: [] };
 SERIES.forEach(k => D[k] = []);
 let rangeMin = 60, lastSnap = null;
-const alarmSeen = {};   // clave alarma -> primer ts visto
 
 function snapToRow(s) {
   const R = s.rates || {}, K = s.kpi || {};
@@ -58,6 +58,7 @@ function snapToRow(s) {
     drop_ps: R.drop_req ?? 0,
     pdd_out: s.pdd?.out?.avg ?? null, pdd_out_p95: s.pdd?.out?.p95 ?? null, pdd_in: s.pdd?.in?.avg ?? null,
     mos_act_avg: s.mos?.active?.avg ?? null, mos_act_min: s.mos?.active?.min ?? null,
+    mos_bad_pct: s.mos?.done?.bad_pct ?? null,
   };
 }
 
@@ -128,7 +129,8 @@ const CHARTS = {
     title: 'ASR y NER', desc: 'efectividad de llamadas · ventana 5 min', ts: 't',
     series: [{ k: 'asr', name: 'ASR %', c: C1 }, { k: 'ner', name: 'NER %', c: C2 }],
     fmt: f1, unit: '%', yMax: 100,
-    refs: () => [{ v: 30, label: 'ASR mín 30%' }, { v: 95, label: 'NER mín 95%' }],
+    refs: s => [{ v: 30, label: 'ASR mín 30%' }, { v: 95, label: 'NER mín 95%' }]
+      .concat(isNum(s?.kpi?.base?.asr) ? [{ v: s.kpi.base.asr, label: `ASR base ${s.kpi.base.mode} ${f1(s.kpi.base.asr)}%` }] : []),
     now: s => [`${f1(s.kpi?.asr)}%`, `NER ${f1(s.kpi?.ner)}%`],
   },
   pdd: {
@@ -373,9 +375,16 @@ function heroTile(id, label, value, unit, cls, subL, subR, sparkKey, badgeTxt) {
     ${sparkKey ? `<canvas id="sp-${id}"></canvas>` : ''}</div>`;
 }
 
+const zTxt = z => isNum(z) ? `<b>${z > 0 ? '+' : ''}${f1(z)}σ</b>` : '';
+// desviacion contra la linea base: aviso a (sigma-1), mayor a sigma
+const zLvl = (z, sig) => !isNum(z) ? null : z <= -sig ? 'serious' : z <= -(sig - 1) ? 'warning' : 'good';
+
 function renderHero(s) {
-  const K = s.kpi || {}, P = s.pdd || {}, M = s.mos || {};
+  const K = s.kpi || {}, P = s.pdd || {}, M = s.mos || {}, B = K.base, SIG = K.base_sigma || 3;
+  const MD = M.done || {};
   const enough = (K.attempts || 0) >= 10;
+  const cover = K.avail_cover_pct ?? 0;
+  const since = K.avail_since ? new Date(K.avail_since * 1000).toLocaleString([], { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : null;
   const tiles = [
     ['calls', 'Llamadas activas', f0(s.active_dialogs), '', 'info',
       `pico 24h <b>${f0(K.calls_24h)}</b>${K.calls_24h_ts ? ' · ' + hhmm(K.calls_24h_ts) : ''}`,
@@ -383,27 +392,33 @@ function renderHero(s) {
     ['regs', 'Usuarios registrados', f0(s.registered), '',
       K.reg_drop_pct >= 15 ? 'critical' : K.reg_drop_pct >= 5 ? 'serious' : s.registered > 0 ? 'good' : 'critical',
       deltaTxt(K.reg_delta_10m, '10 min'), `DB ${f0(s.registered_db)}`, 'registered'],
-    ['cps', 'CPS', f2(K.cps), 'llam/s', 'info',
-      `pico 24h <b>${f2(K.cps_24h)}</b>`, `${f0(K.attempts)} intentos/5m`, 'cps', 'TRÁFICO'],
-    ['asr', 'ASR', f1(K.asr), '%', enough ? lvl(K.asr, 45, 30) : 'info',
-      `${f0(K.answered)} / ${f0(K.attempts)} contestadas`, 'obj ≥ 45%', 'asr', enough ? undefined : 'MUESTRA BAJA'],
-    ['ner', 'NER', f1(K.ner), '%', enough ? lvl(K.ner, 98, 95) : 'info',
-      'sin fallos de red 5xx', 'obj ≥ 98%', 'ner', enough ? undefined : 'MUESTRA BAJA'],
-    ['acd', 'ACD', fmtAcd(K.acd), 'min', isNum(K.acd) ? (K.acd < 30 ? 'warning' : 'good') : 'info',
-      'duración media (est.)', 'mín 0:30', 'acd'],
+    ['cps', 'CPS', f2(K.cps), 'llam/s', (B && B.cps >= 0.2 && zLvl(K.cps_z, SIG)) || 'info',
+      `pico 24h <b>${f2(K.cps_24h)}</b>`, B ? `base ${f2(B.cps)} · ${zTxt(K.cps_z)}` : `${f0(K.attempts)} intentos/5m`, 'cps',
+      B && B.cps >= 0.2 ? undefined : 'TRÁFICO'],
+    ['asr', 'ASR', f1(K.asr), '%', !enough ? 'info' : K.asr < 30 ? 'critical' : zLvl(K.asr_z, SIG) || lvl(K.asr, 45, 30),
+      `${f0(K.answered)} / ${f0(K.attempts)} contestadas`,
+      B ? `base ${B.mode} ${f1(B.asr)}% · ${zTxt(K.asr_z)}` : 'sin línea base aún', 'asr', enough ? undefined : 'MUESTRA BAJA'],
+    ['ner', 'NER', f1(K.ner), '%', (K.ner_n || 0) >= 10 ? lvl(K.ner, 98, 95) : 'info',
+      K.ner_src === 'carrier' ? `${f0(K.ner_n)} intentos · 5xx/408/sin resp.` : 'solo 5xx (sonda SIP apagada)',
+      'obj ≥ 98%', 'ner', (K.ner_n || 0) >= 10 ? undefined : 'MUESTRA BAJA'],
+    ['acd', 'ACD', fmtAcd(K.acd), isNum(K.acd) && K.acd >= 60 ? 'min' : '', (K.acd_n || 0) >= 5 ? (K.acd < 30 ? 'warning' : 'good') : 'info',
+      K.acd_src === 'exacta' ? `exacta · ${f0(K.acd_n)} llam./15m` : 'estimada (Ley de Little)',
+      K.acd_src === 'exacta' ? `mediana ${fmtAcd(K.acd_p50)}` : 'mín 0:30', 'acd',
+      K.acd_src === 'exacta' && (K.acd_n || 0) < 5 ? 'MUESTRA BAJA' : undefined],
     ['pdd', 'PDD saliente', f2(P.out?.avg), 's', (P.out?.n || 0) >= 5 ? lvl(P.out.p95, 3, 5, false) : 'info',
       `p95 <b>${f2(P.out?.p95)} s</b> · ${f0(P.out?.n)} llam.`, `entrante ${isNum(P.in?.avg) ? f0(P.in.avg * 1000) + ' ms' : '—'}`,
       'pdd_out', (P.out?.n || 0) >= 5 ? undefined : 'MUESTRA BAJA'],
-    ['mos', 'MOS por llamada', f2(M.done?.avg ?? M.active?.avg), '/ 5', mosLvl(M.done?.avg ?? M.active?.avg),
-      `<b>${isNum(M.done?.bad_pct) ? f1(M.done.bad_pct) + '%' : '—'}</b> bajo ${f1(M.bad_threshold)} · ${f0(M.done?.n_mos)} llam./15m`,
-      `activas mín ${f1(M.active?.min)}`, 'mos_act_avg'],
+    ['mos', 'Calidad de voz', isNum(MD.bad_pct) ? f1(MD.bad_pct) : '—', `% bajo ${f1(M.bad_threshold)}`,
+      !isNum(MD.bad_pct) || (MD.n_mos || 0) < 10 ? 'info' : MD.bad_pct >= 15 ? 'serious' : MD.bad_pct >= 5 ? 'warning' : 'good',
+      `RTCP <b>${isNum(MD.rtcp_pct) ? f0(MD.rtcp_pct) + '%' : '—'}</b> · MOS ${f2(MD.avg ?? M.active?.avg)}`,
+      `jitter p95 ${isNum(MD.jitter?.p95) ? f0(MD.jitter.p95) + ' ms' : '—'}`, 'mos_bad_pct',
+      (MD.n_mos || 0) < 10 ? 'MUESTRA BAJA' : undefined],
     ['rsr', 'Registro exitoso', f2(K.reg_ok_pct), '%', lvl(K.reg_ok_pct, 99, 95),
       `${f1(s.rates?.register)} REGISTER/s`, 'obj ≥ 99%', null],
-    ['avail', 'Disponibilidad 24h', isNum(K.avail_24h) ? f2(K.avail_24h) : '—', '%', lvl(K.avail_24h, 99.99, 99.9),
-      K.avail_since ? `desde ${new Date(K.avail_since * 1000).toLocaleString([], { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}` : 'sin muestras',
+    ['avail', cover >= 99 ? 'Disponibilidad 24h' : 'Disponibilidad', isNum(K.avail_24h) ? f2(K.avail_24h) : '—', '%',
+      lvl(K.avail_24h, 99.99, 99.9),
+      !since ? 'sin muestras' : cover >= 99 ? `sin servicio ${fmtDur(K.avail_down_s)}` : `desde ${since} · ${f0(cover)}% de 24h`,
       'SLA 99,99%', null],
-    ['rtt', 'Latencia SIP', f1(s.sip_rtt_max), 'ms', lvl(s.sip_rtt_max, 50, 200, false),
-      'OPTIONS máx 4 listeners', `uptime ${fmtDur(s.uptime_s)}`, null],
   ];
   $('hero').innerHTML = tiles.map(t => heroTile(...t)).join('');
   tiles.forEach(t => { if (t[7]) spark($('sp-' + t[0]), D[t[7]].slice(-180), C1()); });
@@ -413,7 +428,7 @@ function renderNE(s) {
   const H = s.health || {}, RTP = s.rtpengine || {}, HA = s.ha || {};
   const items = [];
   const ne = (name, cls, detail) => items.push(`<div class="nei ${cls}" title="${esc(name)} — ${esc(detail)}"><span class="ic"></span><div class="tx"><div class="n">${esc(name)}</div><div class="d">${badge(cls)} ${esc(detail)}</div></div></div>`);
-  ne('Kamailio core', H.kamailio ? 'good' : 'critical', `/healthz HTTP ${s.codes?.healthz ?? '?'}`);
+  ne('Kamailio core', H.kamailio ? 'good' : 'critical', `/healthz ${s.codes?.healthz ?? '?'} · uptime ${fmtDur(s.uptime_s)}`);
   ne('Base de datos', H.db ? 'good' : 'critical', `/readyz ${s.codes?.readyz ?? '?'}`);
   Object.entries(s.sip_ping || {}).forEach(([k, v]) =>
     ne(`SIP ${k}`, v.ok ? (v.ms > 50 ? 'warning' : 'good') : 'serious', v.ok ? `${v.ms} ms` : 'sin respuesta'));
@@ -424,7 +439,7 @@ function renderNE(s) {
   if (HA.vip) ne('keepalived / VIP', HA.keepalived === 'active' ? 'good' : 'serious',
     `${HA.vip || '?'} ${HA.vip_local ? 'MASTER' : 'BACKUP'}`);
   ne('Dispatcher', s.dispatcher_up === s.dispatcher_total ? 'good' : s.dispatcher_up > 0 ? 'warning' : 'serious',
-    `${s.dispatcher_up}/${s.dispatcher_total} destinos UP`);
+    `${s.dispatcher_up}/${s.dispatcher_total} UP${s.dispatcher_disabled ? ` · ${s.dispatcher_disabled} deshab. por config` : ''}`);
   const P = s.pdd || {};
   if (P.status !== 'disabled') ne('Sonda PDD', P.status === 'running' ? 'good' : P.status === 'error' ? 'warning' : 'info',
     P.status === 'running' ? `${f0(P.pending)} INVITE en curso` : (P.error || P.status || '?'));
@@ -432,33 +447,67 @@ function renderNE(s) {
   if (M.status !== 'disabled') ne('Sonda MOS (NG)', M.status === 'running' ? 'good' : M.status === 'error' ? 'warning' : 'info',
     M.status === 'running' ? `${f0(M.active?.n_mos)}/${f0(M.active?.n)} llamadas con RTCP` : (M.error || M.status || '?'));
   const shm = s.shm?.pct ?? 0;
-  ne('Memoria SHM', shm >= 85 ? 'serious' : shm >= 70 ? 'warning' : 'good', `${shm}% usado`);
+  ne('Memoria SHM', shm >= 85 ? 'serious' : shm >= 70 ? 'warning' : 'good', `${shm}% de ${f0((s.shm?.total || 0) / 1048576)} MB`);
+  if (isNum(s.sip_rtt_max)) ne('Latencia SIP', lvl(s.sip_rtt_max, 50, 200, false), `OPTIONS máx ${f1(s.sip_rtt_max)} ms`);
   $('ne').innerHTML = items.join('');
 }
 
+const SEV_CLS = { critical: 'critical', major: 'serious', minor: 'warning' };
+const SEV_TXT = { critical: 'CRÍTICA', major: 'MAYOR', minor: 'MENOR' };
+const sameDay = (a, b) => new Date(a * 1000).toDateString() === new Date(b * 1000).toDateString();
+const fmtWhen = (ts, now) => !isNum(ts) ? '—' : sameDay(ts, now) ? hhmmss(ts)
+  : new Date(ts * 1000).toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + hhmm(ts);
+const ackCell = (a, now) => a.ack_by ? `<span class="ackd">✓ ${esc(a.ack_by)} · ${fmtWhen(a.ack_ts, now)}</span>`
+  : a.id != null ? `<button class="ackbtn" data-ack="${a.id}">Reconocer</button>` : '—';
+
 function renderAlarms(s) {
   const now = s.ts, al = s.alerts || [];
-  const keys = new Set();
-  const order = { critical: 0, major: 1, minor: 2 };
-  const rows = al.map(a => {
-    const key = a.sev + '|' + a.msg.replace(/[\d.,]+/g, '#');
-    keys.add(key);
-    if (!alarmSeen[key]) alarmSeen[key] = now;
-    return { ...a, since: alarmSeen[key] };
-  }).sort((a, b) => order[a.sev] - order[b.sev] || a.since - b.since);
-  Object.keys(alarmSeen).forEach(k => { if (!keys.has(k)) delete alarmSeen[k]; });
-  const sevMap = { critical: 'critical', major: 'serious', minor: 'warning' };
-  const sevTxt = { critical: 'CRÍTICA', major: 'MAYOR', minor: 'MENOR' };
-  $('alarms').innerHTML = rows.length
-    ? rows.map(a => `<tr class="${a.sev}"><td>${badge(sevMap[a.sev], sevTxt[a.sev])}</td><td>${hhmmss(a.since)}</td><td>${fmtDur(now - a.since)}</td><td>${esc(a.msg)}</td></tr>`).join('')
-    : `<tr class="none"><td>${badge('good', 'LIMPIO')}</td><td>—</td><td>—</td><td>Sin alarmas activas</td></tr>`;
+  $('alarms').innerHTML = al.length
+    ? al.map(a => `<tr class="${a.sev}${a.ack_by ? ' acked' : ''}${a.present === false ? ' fading' : ''}"><td>${badge(SEV_CLS[a.sev], SEV_TXT[a.sev])}</td><td>${fmtWhen(a.raised, now)}</td><td>${fmtDur(now - a.raised)}</td><td>${esc(a.msg)}${a.present === false ? ' <span class="hint">· ya no se detecta, limpiando</span>' : ''}</td><td>${ackCell(a, now)}</td></tr>`).join('')
+    : `<tr class="none"><td>${badge('good', 'LIMPIO')}</td><td>—</td><td>—</td><td>Sin alarmas activas</td><td></td></tr>`;
   const cnt = sev => al.filter(a => a.sev === sev).length;
   [['nCrit', 'critical', '.ac.crit'], ['nMaj', 'major', '.ac.maj'], ['nMin', 'minor', '.ac.min']].forEach(([id, sev, sel]) => {
     const n = cnt(sev); $(id).textContent = n;
     document.querySelector(sel).classList.toggle('on', n > 0);
   });
-  $('alarmHint').textContent = `${al.length} activa(s) · duración medida desde que este navegador la detectó`;
+  const unack = al.filter(a => !a.ack_by).length;
+  $('alarmHint').textContent = `${al.length} activa(s) · ${unack} sin reconocer · registradas en el servidor (sobreviven a recargas y cambios de turno)`;
 }
+// pointerdown: la tabla se repinta cada 2 s y un click podria perderse entre mousedown y mouseup
+$('alarms').addEventListener('pointerdown', async e => {
+  const b = e.target.closest('[data-ack]');
+  if (!b || b.disabled) return;
+  b.disabled = true; b.textContent = '…';
+  try {
+    const r = await fetch('api/alarms/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: +b.dataset.ack }) });
+    if (r.status === 401) { location.href = 'login'; return; }
+  } catch (err) { /* se reintenta a mano */ }
+  refresh();
+});
+
+let histOpen = false;
+async function loadAlarmHistory() {
+  if (!histOpen) return;
+  try {
+    const h = await api('api/alarms?hours=24');
+    const ix = {}; h.cols.forEach((c, i) => ix[c] = i);
+    const now = lastSnap?.ts || Date.now() / 1000;
+    $('alarmHistBody').innerHTML = h.rows.length ? h.rows.map(r => {
+      const a = Object.fromEntries(h.cols.map(c => [c, r[ix[c]]]));
+      return `<tr class="${a.sev}"><td>${badge(SEV_CLS[a.sev], SEV_TXT[a.sev])}</td><td>${fmtWhen(a.raised, now)}</td>` +
+        `<td>${a.cleared ? fmtWhen(a.cleared, now) : badge('critical', 'ACTIVA')}</td><td>${fmtDur((a.cleared || now) - a.raised)}</td>` +
+        `<td>${esc(a.msg)}</td><td>${a.ack_by ? `${esc(a.ack_by)} · ${fmtWhen(a.ack_ts, now)}` : '—'}</td></tr>`;
+    }).join('') : '<tr class="none"><td colspan=6>sin alarmas en 24 h</td></tr>';
+  } catch (e) { /* reintenta en el proximo ciclo */ }
+}
+$('histBtn').addEventListener('click', () => {
+  histOpen = !histOpen;
+  $('alarmHist').hidden = !histOpen;
+  $('histBtn').classList.toggle('on', histOpen);
+  $('histBtn').setAttribute('aria-expanded', histOpen);
+  loadAlarmHistory();
+});
 
 function kpi(l, v, u = '', cls = '') {
   return `<div class="kpi ${cls}"><div class="l">${l}</div><div class="v">${v}</div><div class="u">${u}</div></div>`;
@@ -475,7 +524,7 @@ function renderPlatform(s) {
     kpi('CANCEL/s', f1(R.cancel), 'abandonos/s') +
     kpi('5xx/s', f2(R.rpl_5xx), 'errores servidor', R.rpl_5xx > 0.1 ? 'bad' : '') +
     kpi('Descartados/s', f1(R.drop_req), 'pike/antiflood', R.drop_req > 1 ? 'warn' : '') +
-    kpi('SHM', shm + '%', 'memoria compartida', shm > 85 ? 'bad' : shm > 70 ? 'warn' : '') +
+    kpi('SHM', shm + '%', `${f0((s.shm?.used || 0) / 1048576)}/${f0((s.shm?.total || 0) / 1048576)} MB compartida`, shm > 85 ? 'bad' : shm > 70 ? 'warn' : '') +
     kpi('CPU', f1(SYS.cpu_pct) + '%', `load ${f2((SYS.load || [])[0])}`, SYS.cpu_pct >= 90 ? 'bad' : SYS.cpu_pct >= 75 ? 'warn' : '') +
     kpi('RAM', f1(MEM.pct) + '%', `${f0(MEM.used_mb)}/${f0(MEM.total_mb)} MB`, MEM.pct >= 90 ? 'bad' : MEM.pct >= 80 ? 'warn' : '') +
     kpi('Disco', f0(SYS.disk_max_pct) + '%', 'punto más lleno', SYS.disk_max_pct >= 90 ? 'bad' : SYS.disk_max_pct >= 80 ? 'warn' : '') +
@@ -489,13 +538,14 @@ function renderPlatform(s) {
     row('Kamailio /healthz', H.kamailio, 'HTTP ' + (s.codes?.healthz ?? '?')) +
     row('Readiness + DB', H.db, '/readyz ' + (s.codes?.readyz ?? '?')) +
     row('SIP OPTIONS activo', H.sip_ping, '4 listeners UDP') +
-    row('Dispatcher', H.dispatcher, `${s.dispatcher_up}/${s.dispatcher_total} UP`) +
+    row('Dispatcher', H.dispatcher, `${s.dispatcher_up}/${s.dispatcher_total} UP` + (s.dispatcher_disabled ? ` · ${s.dispatcher_disabled} deshabilitados` : '')) +
     row('Métricas core', H.metrics, 'kamcmd stats') +
     row('SHM < 85%', H.shm_ok, shm + '% usado') +
     row('RTPEngine', RTP.status === 'active', 'kernel ' + (RTP.kernel_mode ? '✓' : '✗'));
 
+  // D* = deshabilitado en dispatcher.list (sin sondeo): no es una caida, se muestra en gris
   $('dsptable').querySelector('tbody').innerHTML = (s.dispatcher || []).map(d =>
-    `<tr><td>${d.set ?? '—'}</td><td>${esc(d.uri)}</td><td>${esc(d.flags)}</td><td>${d.ignored ? badge('info', 'EXCLUIDO') : badge(d.up ? 'good' : 'serious', d.up ? 'UP' : 'DOWN')}</td></tr>`).join('')
+    `<tr class="${d.disabled || d.ignored ? 'muted' : ''}"><td>${d.set ?? '—'}</td><td>${esc(d.uri)}</td><td>${esc(d.flags)}</td><td>${d.disabled ? badge('info', 'DESHABILITADO POR CONFIG') : d.ignored ? badge('info', 'EXCLUIDO') : badge(d.up ? 'good' : 'serious', d.up ? 'UP' : 'DOWN')}</td></tr>`).join('')
     || '<tr><td colspan=4>sin destinos</td></tr>';
 
   const HA = s.ha || { peers: [] };
@@ -523,19 +573,23 @@ function renderPlatform(s) {
   (SYS.net || []).forEach(n => rows2.push(`<tr><td>Red ${esc(n.if)}</td><td>↓ ${n.rx_kbs} ↑ ${n.tx_kbs} KB/s</td></tr>`));
   rows2.push(`<tr><td>Uptime sistema</td><td>${fmtDur(SYS.uptime_s)}</td></tr>`);
   rows2.push(`<tr><td>Swap usado</td><td>${SYS.swap_pct ?? 0}%</td></tr>`);
-  rows2.push(`<tr><td>Kamailio</td><td>${SYS.kam_procs ?? 0} procs · ${SYS.kam_rss_mb ?? 0} MB RSS</td></tr>`);
+  const KM = SYS.kam_mem || {};
+  rows2.push(`<tr><td>Kamailio</td><td>${f0(KM.procs)} procs · PSS ${f0(KM.pss_mb)} MB <span class="hint">(SHM ${f0(KM.pss_shm_mb)} + privada ${f0(KM.pss_priv_mb)})</span> · PKG en uso ${f0(KM.pkg_used_mb)} MB</td></tr>`);
   if (SYS.temp_max != null) rows2.push(`<tr><td>Temp máx</td><td>${SYS.temp_max} °C</td></tr>`);
   $('hwtable').querySelector('tbody').innerHTML = rows2.join('');
   $('hwinfo').textContent = `RAM ${f0(MEM.used_mb)}/${f0(MEM.total_mb)} MB`;
 }
 
 const shortId = id => id.length > 22 ? id.slice(0, 10) + '…' + id.slice(-8) : id;
-const qrow = (c, cols) => `<tr>${cols.map(k => {
+const DIR = { out: 'SAL', in: 'ENT' };
+const qrow = (c, cols) => `<tr title="Call-ID ${esc(c.call_id)}">${cols.map(k => {
   if (k === 'mos') return `<td>${isNum(c.mos) ? badge(mosLvl(c.mos), f2(c.mos)) : badge('info', 'sin RTCP')}</td>`;
-  if (k === 'call_id') return `<td title="${esc(c.call_id)}"><code>${esc(shortId(c.call_id))}</code></td>`;
+  if (k === 'sub') return `<td>${c.sub ? `<b>${esc(c.sub)}</b>` : '<span class="hint">—</span>'}<div class="sub2">${esc(c.ua || c.remote || '')}${c.ua && c.remote ? ' · ' + esc(c.remote) : ''}</div></td>`;
+  if (k === 'route') return c.src_user || c.dst_user
+    ? `<td>${c.dir ? `<span class="dir">${DIR[c.dir] || c.dir}</span>` : ''}${esc(c.src_user || '?')} → ${esc(c.dst_user || '?')}</td>`
+    : `<td><span class="hint">INVITE no capturado</span><div class="sub2"><code>${esc(shortId(c.call_id))}</code></div></td>`;
   if (k === 'dur') return `<td>${fmtDur(c.dur)}</td>`;
   if (k === 'ended') return `<td>${hhmmss(c.ended)}</td>`;
-  if (k === 'mos_low') return `<td>${f1(c.mos_low)}</td>`;
   if (k === 'jitter') return `<td>${isNum(c.jitter) ? f0(c.jitter) + ' ms' : '—'}</td>`;
   if (k === 'loss') return `<td>${isNum(c.loss) ? f1(c.loss) + '%' : '—'}</td>`;
   if (k === 'rtt') return `<td>${isNum(c.rtt) ? f0(c.rtt) + ' ms' : '—'}</td>`;
@@ -543,11 +597,66 @@ const qrow = (c, cols) => `<tr>${cols.map(k => {
 }).join('')}</tr>`;
 function renderWorstActive(s) {
   const W = s.mos?.worst_active || [];
-  $('worstAct').innerHTML = W.length ? W.map(c => qrow(c, ['call_id', 'remote', 'codec', 'dur', 'mos', 'mos_low', 'jitter', 'loss', 'rtt'])).join('')
-    : '<tr><td colspan=9>sin llamadas activas con RTCP</td></tr>';
+  $('worstAct').innerHTML = W.length ? W.map(c => qrow(c, ['sub', 'route', 'codec', 'dur', 'mos', 'jitter', 'loss', 'rtt'])).join('')
+    : '<tr><td colspan=8>sin llamadas activas con RTCP</td></tr>';
   const A = s.mos?.active || {};
   $('worstHint').textContent = `${f0(A.n_mos)} de ${f0(A.n)} llamadas reportan MOS (requiere RTCP)`;
 }
+function renderQuality(s) {
+  const M = s.mos?.done || {}, A = s.mos?.active || {}, J = M.jitter || {}, L = M.loss || {}, R = M.rtt || {};
+  const ms = v => isNum(v) ? f0(v) : '—';
+  $('qstrip').innerHTML =
+    kpi('Cobertura RTCP', isNum(M.rtcp_pct) ? f0(M.rtcp_pct) + '%' : '—',
+      `${f0(M.n_mos)}/${f0(M.n)} finalizadas 15 min · activas ${isNum(A.rtcp_pct) ? f0(A.rtcp_pct) + '%' : '—'}`,
+      isNum(M.rtcp_pct) && M.n >= 10 && M.rtcp_pct < 70 ? 'warn' : '') +
+    kpi('MOS bajo umbral', isNum(M.bad_pct) ? f1(M.bad_pct) + '%' : '—',
+      `${f0(M.bad)}/${f0(M.n_mos)} bajo ${f1(s.mos?.bad_threshold)} · prom ${f2(M.avg)}`,
+      M.bad_pct >= 15 ? 'bad' : M.bad_pct >= 5 ? 'warn' : '') +
+    kpi('Jitter p95', ms(J.p95) + ' ms', `p50 ${ms(J.p50)} · máx ${ms(J.max)} ms`, J.p95 >= 30 ? 'bad' : J.p95 >= 20 ? 'warn' : '') +
+    kpi('Pérdida p95', isNum(L.p95) ? f1(L.p95) + '%' : '—', `p50 ${f1(L.p50)} · máx ${f1(L.max)} %`, L.p95 >= 3 ? 'bad' : L.p95 >= 1 ? 'warn' : '') +
+    kpi('RTT p50 / p95', `${ms(R.p50)} / ${ms(R.p95)}`, `ms · máx ${ms(R.max)} ms`, R.p95 >= 300 ? 'bad' : R.p95 >= 150 ? 'warn' : '');
+}
+
+// respuestas finales a INVITE: explica caidas de ASR (486/487/480/404 son usuario, 5xx/408/sin resp. red)
+const OUT_LBL = { '2xx': '2xx contestada', '486': '486 ocupado', '487': '487 cancelada antes de contestar',
+  '480': '480 no disponible', '404': '404 número inexistente', '408': '408 timeout', '403': '403 prohibido',
+  '603': '603 rechazada', '4xx otros': 'otros 4xx', '3xx': '3xx redirección', '5xx': '5xx falla red/servidor',
+  '6xx otros': 'otros 6xx', 'sin respuesta': 'sin respuesta (32 s)' };
+const OUT_CLS = { '2xx': 'ok', '5xx': 'net', 'sin respuesta': 'net', '408': 'net' };
+function renderOutcomes(s) {
+  const O = s.outcomes || {}, cats = O.cats || [], mx = Math.max(1, ...cats.map(c => c.n));
+  $('outcomes').innerHTML = cats.length ? cats.map(c =>
+    `<tr><td>${OUT_LBL[c.k] || esc(c.k)}</td><td>${f0(c.out)}</td><td>${f0(c.in)}</td><td><b>${f0(c.n)}</b></td><td>${f1(c.pct)}%</td>` +
+    `<td class="barcell"><div class="bar ${OUT_CLS[c.k] || ''}" style="width:${(100 * c.n / mx).toFixed(1)}%"></div></td></tr>`).join('')
+    : `<tr><td colspan=6>${s.pdd?.status === 'running' ? 'sin intentos en 5 min' : 'sonda SIP no disponible'}</td></tr>`;
+  const N = O.net_fail || {};
+  $('outHint').innerHTML = `${f0(O.total)} intentos · NER carrier <b>${f1(O.ner)}%</b> · fallos de red: 5xx ${f0(N['5xx'])} · 408 sin timbrar ${f0(N['408'])} · sin respuesta ${f0(N.noresp)}`;
+}
+
+let secMode = 'ip';
+const SEC_HEAD = {
+  ip: '<tr><th>IP</th><th>403</th><th>%</th><th>Usuario</th><th>User-Agent</th><th>Método</th><th>Bloqueo</th></tr>',
+  ua: '<tr><th>User-Agent</th><th>403</th><th>%</th></tr>',
+  user: '<tr><th>Usuario (From)</th><th>403</th><th>%</th></tr>',
+};
+function renderSecurity(s) {
+  const S = s.security || {};
+  const meth = Object.entries(S.methods || {}).map(([m, n]) => `${esc(m)} ${f0(n)}`).join(' · ');
+  const sipJail = (S.f2b_jails || []).some(j => /sip|kam|voip|asterisk/i.test(j));
+  $('secHint').innerHTML = `<b>${f2(S.rate)}</b> 403/s · ${f0(S.total)} en ${fmtDur(S.span_s || S.window_s)} · ${f0(S.unique_ips)} IPs distintas · ${meth || '—'}<br>` +
+    `htable ipban: <b>${f0(S.ipban_n)}</b> IPs · fail2ban: ${sipJail ? `${f0(S.f2b_n)} IPs baneadas` : `sin jail SIP (${esc((S.f2b_jails || []).join(', ') || 'ninguna')})`}`;
+  $('secHead').innerHTML = SEC_HEAD[secMode];
+  const rows = secMode === 'ip' ? S.top_ips : secMode === 'ua' ? S.top_uas : S.top_users;
+  $('secBody').innerHTML = (rows || []).length ? rows.map(r => secMode === 'ip'
+    ? `<tr><td><code>${esc(r.ip)}</code></td><td>${f0(r.n)}</td><td>${f1(r.pct)}%</td><td>${esc(r.user || '—')}${r.users > 1 ? ` <span class="hint">+${r.users - 1}</span>` : ''}</td>` +
+      `<td><div class="sub2">${esc(r.ua || '—')}</div></td><td>${esc(r.meth)}</td><td>${r.ban.length ? r.ban.map(b => badge('warning', b.toUpperCase())).join(' ') : '—'}</td></tr>`
+    : `<tr><td>${esc(secMode === 'ua' ? r.ua : r.user)}</td><td>${f0(r.n)}</td><td>${f1(r.pct)}%</td></tr>`).join('')
+    : `<tr><td colspan=7>sin 403 en la ventana</td></tr>`;
+}
+document.querySelectorAll('#secMode button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#secMode button').forEach(x => x.classList.toggle('on', x === b));
+  secMode = b.dataset.v; if (lastSnap) renderSecurity(lastSnap);
+}));
 let callsMode = 'recent';
 async function loadCalls() {
   try {
@@ -555,8 +664,8 @@ async function loadCalls() {
     const r = await api(`api/calls?minutes=${Math.max(rangeMin, 60)}&${q}`);
     const ix = {}; r.cols.forEach((c, i) => ix[c] = i);
     const rows = r.rows.slice(0, 60).map(x => Object.fromEntries(r.cols.map(c => [c, x[ix[c]]])));
-    $('doneCalls').innerHTML = rows.length ? rows.map(c => qrow(c, ['ended', 'call_id', 'remote', 'dur', 'mos', 'mos_low', 'jitter', 'loss', 'rtt'])).join('')
-      : '<tr><td colspan=9>sin llamadas en el periodo</td></tr>';
+    $('doneCalls').innerHTML = rows.length ? rows.map(c => qrow(c, ['ended', 'sub', 'route', 'dur', 'mos', 'jitter', 'loss', 'rtt'])).join('')
+      : '<tr><td colspan=8>sin llamadas en el periodo</td></tr>';
     $('doneHint').textContent = `${f0(r.total)} finalizadas · ${f0(r.with_mos)} con MOS · prom ${f2(r.avg_mos)} · ${f0(r.bad)} bajo ${f1(r.bad_threshold)} · últimas ${Math.max(rangeMin, 60) / 60} h`;
   } catch (e) { /* reintenta en el proximo ciclo */ }
 }
@@ -582,6 +691,7 @@ async function refresh() {
     $('site').textContent = s.site || s.domain || '';
     document.title = (s.alerts?.length ? `(${s.alerts.length}) ` : '') + 'Kamailio NOC';
     renderAlarms(s); renderNE(s); renderPlatform(s); renderWorstActive(s);
+    renderQuality(s); renderOutcomes(s); renderSecurity(s);
     pushLive(s);
     renderHero(s);
   } catch (e) { $('gstatus').textContent = 'SIN DATOS (' + e.message + ')'; $('gstatus').className = 'pill critical'; }
@@ -602,7 +712,7 @@ try {
   }
 } catch (e) { /* sin storage */ }
 buildCharts();
-(async () => { await loadHistory(); await refresh(); loadCalls(); setInterval(refresh, 2000); setInterval(() => { if (!document.hidden) loadCalls(); }, 15000); })();
+(async () => { await loadHistory(); await refresh(); loadCalls(); setInterval(refresh, 2000); setInterval(() => { if (!document.hidden) { loadCalls(); loadAlarmHistory(); } }, 15000); })();
 let rsz = null;
 window.addEventListener('resize', () => { clearTimeout(rsz); rsz = setTimeout(() => { paintCharts(); if (lastSnap) renderHero(lastSnap); }, 150); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });

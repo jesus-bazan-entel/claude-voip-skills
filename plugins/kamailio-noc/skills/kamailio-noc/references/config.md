@@ -19,3 +19,12 @@ valor por defecto de `DEFAULT_CONFIG` en `app.py`. Reiniciar `kamailio-noc` tras
 | `pdd.enabled`, `pdd.bpf` | sonda PDD y filtro BPF (puertos SIP) | `enabled: false` |
 | `mos_bad` | umbral de MOS "malo" | 3.6 |
 | `listen_port` | puerto local del servicio (`NOC_PORT` lo sobreescribe) | 8899 |
+| `baseline_sigma` | σ bajo la línea base de ASR/CPS para alarmar (major) | 3.0 |
+| `notify.telegram_token`, `notify.telegram_chat` | bot y chat de Telegram para alarmas | `""` → sin Telegram |
+| `notify.webhook_url` | POST JSON `{event, id, severity, message, raised, ts, site, host, text}` | `""` → sin webhook |
+| `notify.min_sev` | severidad mínima notificada (`minor`/`major`/`critical`) | `major` |
+| `notify.delay_s` | segundos que la alarma debe persistir antes de notificar (anti-aleteo) | 30 |
+
+`pdd.enabled: false` apaga toda la sonda SIP pasiva: además del PDD se pierden el desglose de
+respuestas, el NER carrier (vuelve a solo 5xx), el ACD exacto (vuelve a Ley de Little),
+origen/destino por llamada y el panel de 403.

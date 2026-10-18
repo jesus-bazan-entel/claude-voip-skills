@@ -32,8 +32,12 @@
 </header>
 
 <section class="alarms" id="alarmPanel">
-  <div class="sect-h"><h2>Alarmas activas</h2><span class="hint" id="alarmHint"></span></div>
-  <table class="alarmtbl"><thead><tr><th>Sev.</th><th>Desde</th><th>Duración</th><th>Descripción</th></tr></thead><tbody id="alarms"></tbody></table>
+  <div class="sect-h"><h2>Alarmas activas</h2><span class="hint" id="alarmHint"></span>
+    <button class="ghost" id="histBtn" aria-expanded="false">Historial 24 h</button></div>
+  <table class="alarmtbl"><thead><tr><th>Sev.</th><th>Desde</th><th>Duración</th><th>Descripción</th><th>Reconocimiento</th></tr></thead><tbody id="alarms"></tbody></table>
+  <div class="histwrap tscroll" id="alarmHist" hidden>
+    <table class="alarmtbl"><thead><tr><th>Sev.</th><th>Inicio</th><th>Fin</th><th>Duración</th><th>Descripción</th><th>Reconocida</th></tr></thead><tbody id="alarmHistBody"></tbody></table>
+  </div>
 </section>
 
 <section class="sect">
@@ -63,17 +67,35 @@
 </section>
 
 <section class="sect">
-  <div class="sect-h"><h2>Calidad por llamada</h2><span class="hint">MOS, jitter, pérdida y RTT por llamada desde RTCP · peor pierna</span></div>
+  <div class="sect-h"><h2>Resultados de llamada y seguridad</h2><span class="hint">sonda SIP pasiva · respuesta final por llamada y 403 enviados por el proxy</span></div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Respuestas finales a INVITE <span class="hint">últimos 5 min</span></h3>
+      <div class="tscroll"><table class="tbl"><thead><tr><th>Resultado</th><th>Saliente</th><th>Entrante</th><th>Total</th><th>%</th><th class="barcell"></th></tr></thead><tbody id="outcomes"></tbody></table></div>
+      <div class="ruta" id="outHint"></div>
+    </div>
+    <div class="card">
+      <div class="ch2"><h3>Rechazos 403 <span class="hint">últimos 15 min</span></h3>
+        <div class="seg small" id="secMode"><button data-v="ip" class="on">IPs</button><button data-v="ua">User-Agent</button><button data-v="user">Usuarios</button></div></div>
+      <div class="ruta" id="secHint"></div>
+      <div class="tscroll"><table class="tbl"><thead id="secHead"></thead><tbody id="secBody"></tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<section class="sect">
+  <div class="sect-h"><h2>Calidad por llamada</h2><span class="hint">RTCP vía RTPEngine · peor pierna · el MOS se satura en 4,3 con G.711: mire la distribución</span></div>
+  <div class="kpis" id="qstrip"></div>
   <div class="grid2">
     <div class="card">
       <h3>Llamadas activas — peor calidad <span class="hint" id="worstHint"></span></h3>
-      <div class="tscroll"><table class="tbl"><thead><tr><th>Call-ID</th><th>Remoto</th><th>Códec</th><th>Duración</th><th>MOS</th><th>MOS mín</th><th>Jitter</th><th>Pérdida</th><th>RTT</th></tr></thead><tbody id="worstAct"></tbody></table></div>
+      <div class="tscroll"><table class="tbl"><thead><tr><th>Abonado / ONT</th><th>Origen → Destino</th><th>Códec</th><th>Duración</th><th>MOS</th><th>Jitter</th><th>Pérdida</th><th>RTT</th></tr></thead><tbody id="worstAct"></tbody></table></div>
     </div>
     <div class="card">
       <div class="ch2"><h3>Llamadas finalizadas</h3>
         <div class="seg small" id="callsMode"><button data-v="recent" class="on">Recientes</button><button data-v="worst">Peor MOS</button><button data-v="bad">Solo bajo umbral</button></div></div>
       <div class="ruta" id="doneHint"></div>
-      <div class="tscroll"><table class="tbl"><thead><tr><th>Fin</th><th>Call-ID</th><th>Remoto</th><th>Duración</th><th>MOS</th><th>MOS mín</th><th>Jitter</th><th>Pérdida</th><th>RTT</th></tr></thead><tbody id="doneCalls"></tbody></table></div>
+      <div class="tscroll"><table class="tbl"><thead><tr><th>Fin</th><th>Abonado / ONT</th><th>Origen → Destino</th><th>Duración</th><th>MOS</th><th>Jitter</th><th>Pérdida</th><th>RTT</th></tr></thead><tbody id="doneCalls"></tbody></table></div>
     </div>
   </div>
 </section>
@@ -114,10 +136,14 @@
   </div>
 </section>
 
-<footer>Kamailio NOC · fuentes: <code>kamcmd stats</code> · <code>dlg.stats_active</code> · usrloc · OPTIONS activo · MySQL location · RTPEngine · refresco 2 s ·
-ASR = llamadas contestadas / intentos (dialog) · NER = 1 − fallos 5xx / intentos · ACD estimado por Ley de Little (llamadas activas ÷ contestadas/s) ·
+<footer>Kamailio NOC · fuentes: <code>kamcmd stats</code> · <code>dlg.stats_active</code> · usrloc · OPTIONS activo · MySQL location · RTPEngine · sonda SIP pasiva · refresco 2 s ·
+ASR = llamadas contestadas / intentos (dialog), comparado con la misma hora de semanas previas (o días previos mientras no haya 7 días de historia) ·
+NER carrier = 1 − (5xx + 408 sin timbrar + INVITE sin respuesta en 32 s) / intentos, sobre respuestas finales capturadas; 486/487/480/404/603 son causas de usuario ·
+ACD exacto = promedio 2xx → BYE de las llamadas terminadas en 15 min ·
 PDD = INVITE inicial (o el reintento con credenciales tras 401/407) → primer 180/183/2xx, medido por captura pasiva UDP 5060/5070 ·
-MOS por llamada = RTCP reportado por RTPEngine (NG query), peor pierna; sin RTCP no hay MOS</footer>
+Disponibilidad = % de muestras de las últimas 24 h sin alarma crítica, persistidas en SQLite; si el NOC estuvo caído se indica la cobertura ·
+MOS por llamada = RTCP reportado por RTPEngine (NG query), peor pierna; sin RTCP no hay MOS · Memoria Kamailio en PSS (RSS cuenta la SHM una vez por proceso) ·
+Alarmas guardadas en el servidor con historial, reconocimiento y notificación opcional (Telegram / webhook en noc.conf.json)</footer>
 <div id="tip" class="tip" hidden></div>
 <script src="app.js"></script>
 </body>

@@ -160,7 +160,7 @@ const CHARTS = {
     now: s => [f1(s.rates?.total_req), 'req/s'],
   },
   sec: {
-    title: 'Seguridad y autenticación', desc: 'challenges, rechazos y requests descartados (pike/antiflood)', ts: 't',
+    title: 'Seguridad y autenticación', desc: 'challenges, rechazos y core:drop_requests (incluye ACK a 401/407 que sl absorbe)', ts: 't',
     series: [{ k: 'auth_401_ps', name: '401 challenge', c: C1 }, { k: 'auth_403_ps', name: '403 rechazado', c: C2 },
       { k: 'drop_ps', name: 'Descartados', c: C3 }], fmt: f1, unit: '/s',
     now: s => [f1(s.rates?.auth_403), '403/s'],
@@ -442,7 +442,7 @@ function renderNE(s) {
     `${s.dispatcher_up}/${s.dispatcher_total} UP${s.dispatcher_disabled ? ` · ${s.dispatcher_disabled} deshab. por config` : ''}`);
   const P = s.pdd || {};
   if (P.status !== 'disabled') ne('Sonda PDD', P.status === 'running' ? 'good' : P.status === 'error' ? 'warning' : 'info',
-    P.status === 'running' ? `${f0(P.pending)} INVITE en curso` : (P.error || P.status || '?'));
+    P.status === 'running' ? `${f0(P.pending)} INVITE en curso${P.kdrops ? ` · ${f0(P.kdrops)} pkt perdidos` : ''}` : (P.error || P.status || '?'));
   const M = s.mos || {};
   if (M.status !== 'disabled') ne('Sonda MOS (NG)', M.status === 'running' ? 'good' : M.status === 'error' ? 'warning' : 'info',
     M.status === 'running' ? `${f0(M.active?.n_mos)}/${f0(M.active?.n)} llamadas con RTCP` : (M.error || M.status || '?'));
@@ -523,7 +523,11 @@ function renderPlatform(s) {
     kpi('BYE/s', f1(R.bye), 'cuelgues/s') +
     kpi('CANCEL/s', f1(R.cancel), 'abandonos/s') +
     kpi('5xx/s', f2(R.rpl_5xx), 'errores servidor', R.rpl_5xx > 0.1 ? 'bad' : '') +
-    kpi('Descartados/s', f1(R.drop_req), 'pike/antiflood', R.drop_req > 1 ? 'warn' : '') +
+    kpi('Descartados/s', f2(s.kpi?.drop_ps), isNum(s.security?.ack_abs_rate)
+      ? `drop_requests 5 min · ACK a 401/407 ${f2(s.security.ack_abs_rate)}/s` : 'drop_requests 5 min',
+      (s.security?.silent?.rate || 0) >= 1 ? 'warn' : '') +
+    kpi('Ignoradas/s', f2(s.security?.silent?.rate), 'sin respuesta ni reenvío · 5 min',
+      (s.security?.silent?.rate || 0) >= 1 ? 'warn' : '') +
     kpi('SHM', shm + '%', `${f0((s.shm?.used || 0) / 1048576)}/${f0((s.shm?.total || 0) / 1048576)} MB compartida`, shm > 85 ? 'bad' : shm > 70 ? 'warn' : '') +
     kpi('CPU', f1(SYS.cpu_pct) + '%', `load ${f2((SYS.load || [])[0])}`, SYS.cpu_pct >= 90 ? 'bad' : SYS.cpu_pct >= 75 ? 'warn' : '') +
     kpi('RAM', f1(MEM.pct) + '%', `${f0(MEM.used_mb)}/${f0(MEM.total_mb)} MB`, MEM.pct >= 90 ? 'bad' : MEM.pct >= 80 ? 'warn' : '') +
@@ -638,6 +642,7 @@ const SEC_HEAD = {
   ip: '<tr><th>IP</th><th>403</th><th>%</th><th>Usuario</th><th>User-Agent</th><th>Método</th><th>Bloqueo</th></tr>',
   ua: '<tr><th>User-Agent</th><th>403</th><th>%</th></tr>',
   user: '<tr><th>Usuario (From)</th><th>403</th><th>%</th></tr>',
+  silent: '<tr><th>IP</th><th>Ignoradas</th><th>%</th><th>Método</th><th>Usuario</th><th>User-Agent</th></tr>',
 };
 function renderSecurity(s) {
   const S = s.security || {};
@@ -645,7 +650,18 @@ function renderSecurity(s) {
   const sipJail = (S.f2b_jails || []).some(j => /sip|kam|voip|asterisk/i.test(j));
   $('secHint').innerHTML = `<b>${f2(S.rate)}</b> 403/s · ${f0(S.total)} en ${fmtDur(S.span_s || S.window_s)} · ${f0(S.unique_ips)} IPs distintas · ${meth || '—'}<br>` +
     `htable ipban: <b>${f0(S.ipban_n)}</b> IPs · fail2ban: ${sipJail ? `${f0(S.f2b_n)} IPs baneadas` : `sin jail SIP (${esc((S.f2b_jails || []).join(', ') || 'ninguna')})`}`;
+  const SL = S.silent || {};
+  $('secHint').innerHTML += `<br>Ignoradas sin respuesta ni reenvío: <b>${f2(SL.rate)}</b>/s (5 min, ${f0(SL.unique_ips)} IPs) · ` +
+    `ACK a 401/407 absorbidos: ${f2(S.ack_abs_rate)}/s (normal: explican core:drop_requests)`;
+  $('secWin').textContent = secMode === 'silent' ? 'sin respuesta ni reenvío · últimos 5 min' : '403 · últimos 15 min';
   $('secHead').innerHTML = SEC_HEAD[secMode];
+  if (secMode === 'silent') {
+    $('secBody').innerHTML = (SL.top || []).length ? SL.top.map(r =>
+      `<tr><td><code>${esc(r.ip)}</code></td><td>${f0(r.n)}</td><td>${f1(r.pct)}%</td><td>${esc(r.meth)}</td>` +
+      `<td>${esc(r.user || '—')}</td><td><div class="sub2">${esc(r.ua || '—')}</div></td></tr>`).join('')
+      : '<tr><td colspan=6>ninguna petición ignorada en 5 min</td></tr>';
+    return;
+  }
   const rows = secMode === 'ip' ? S.top_ips : secMode === 'ua' ? S.top_uas : S.top_users;
   $('secBody').innerHTML = (rows || []).length ? rows.map(r => secMode === 'ip'
     ? `<tr><td><code>${esc(r.ip)}</code></td><td>${f0(r.n)}</td><td>${f1(r.pct)}%</td><td>${esc(r.user || '—')}${r.users > 1 ? ` <span class="hint">+${r.users - 1}</span>` : ''}</td>` +

@@ -155,7 +155,7 @@ RATE_MAP = {
 KPI_WINDOW = 300          # s, ventana para ASR/NER/CPS/ACD/RSR
 WIN_KEYS = ("dialog:processed_dialogs", "dialog:failed_dialogs",
             "core:rcv_replies_5xx_invite", "registrar:accepted_regs",
-            "registrar:rejected_regs")
+            "registrar:rejected_regs", "core:drop_requests")
 
 # columnas nuevas del historico (ALTER TABLE si faltan)
 EXTRA_COLS = [("early", "INTEGER"), ("cps", "REAL"), ("asr", "REAL"), ("ner", "REAL"),
@@ -523,7 +523,14 @@ pdd = {"res": deque(maxlen=20000), "noresp": deque(maxlen=5000), "pend": {},
        "final": deque(maxlen=50000), "acd": deque(maxlen=20000),
        "status": "init", "error": "", "pkts": 0, "since": None}
 sip_meta = {}                   # call-id -> partes de la llamada
-sec = {"r403": deque(maxlen=200000), "ua": {}}  # (ts, ip, user, metodo); ip ofensora -> UA
+sec = {"r403": deque(maxlen=200000), "ua": {},  # (ts, ip, user, metodo); ip ofensora -> UA
+       "silent": deque(maxlen=50000),  # (ts, metodo, ip, user, ua): peticion sin respuesta ni reenvio
+       "ack_abs": deque(maxlen=50000),  # ts de ACK a negativas generadas por el proxy (sl las cuenta como drop)
+       "rq": {}}                         # (call-id, cseq) -> [ts, metodo, ip, cabecera, copias] en espera de salida
+SILENT_AFTER = 8                # s sin respuesta ni reenvio del proxy = peticion ignorada
+_CID = re.compile(rb"^(?:call-id|i)[ \t]*:[ \t]*(\S+)", re.I | re.M)
+_CSEQN = re.compile(rb"^cseq[ \t]*:[ \t]*(\d+)", re.I | re.M)
+_FROM_HDR = re.compile(rb"^(?:from|f)[ \t]*:([^\r\n]*)", re.I | re.M)
 _PDD_HDR = re.compile(r"^(call-id|i|cseq|to|t|from|f|user-agent|server)\s*:\s*(.*)$", re.I | re.M)
 _UA_HDR = re.compile(rb"^user-agent\s*:\s*([^\r\n]*)", re.I | re.M)
 _URI_USER = re.compile(r"sips?:([^@;>\s]+)@", re.I)
@@ -558,8 +565,21 @@ def _pdd_socket():
     buf = ctypes.create_string_buffer(code)
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))  # ETH_P_ALL
     s.setsockopt(socket.SOL_SOCKET, 26, struct.pack("HL", n, ctypes.addressof(buf)))  # SO_ATTACH_FILTER
+    try:  # rafagas a >3k pkt/s; FORCE (root) ignora net.core.rmem_max
+        s.setsockopt(socket.SOL_SOCKET, 33, 16 << 20)  # SO_RCVBUFFORCE
+    except OSError:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
     s.settimeout(1.0)
     return s, buf
+
+
+def _pkt_drops(sock):
+    """PACKET_STATISTICS (acumulado y se reinicia al leer): paquetes que el kernel descarto."""
+    try:
+        _, drops = struct.unpack("II", sock.getsockopt(263, 6, 8))  # SOL_PACKET, PACKET_STATISTICS
+        return drops
+    except OSError:
+        return 0
 
 
 def pdd_loop():
@@ -586,7 +606,7 @@ def _pdd_gc(now):
                 del pend[cid]
         elif not p["resp"] and age > PDD_TIMER_B:
             del pend[cid]
-            pdd["noresp"].append((now, p["dir"]))
+            pdd["noresp"].append((now, p["dir"], p.get("fwd", "")))
             m = sip_meta.get(cid)
             if m:
                 m["end"] = now
@@ -596,12 +616,24 @@ def _pdd_gc(now):
         if (m.get("end") and now - m["end"] > 180) or now - m["t0"] > META_MAX_AGE or \
                 (not m.get("ans") and cid not in pend and now - m["t0"] > 120):
             del sip_meta[cid]
+    rq = sec["rq"]
+    for k, v in list(rq.items()):
+        if now - v[0] > SILENT_AFTER:
+            del rq[k]
+            if v[4] < 2:  # sin retransmision: el cliente si recibio respuesta (la perdio la sonda)
+                continue
+            hdr = v[3]
+            mf, mu = _FROM_HDR.search(hdr), _UA_HDR.search(hdr)
+            sec["silent"].append((v[0], v[1], v[2], _uri_user(mf.group(1).decode("latin-1")) if mf else "",
+                                  mu.group(1).decode("latin-1").strip()[:80] if mu else ""))
+    if len(rq) > 50000:  # proteccion de memoria ante una avalancha
+        rq.clear()
     if len(sec["ua"]) > 50000:  # solo ofensores con 403 en la ultima hora
         keep = {r[1] for r in list(sec["r403"]) if now - r[0] <= 3600}
         sec["ua"] = {ip: ua for ip, ua in sec["ua"].items() if ip in keep}
 
 
-def _on_invite(pl, src, now):
+def _on_invite(pl, src, dst, now):
     h = _pdd_hdrs(pl)
     cid, cseq = h.get("call-id"), h.get("cseq", "")
     if not cid or ";tag=" in h.get("to", "").replace(" ", ""):
@@ -621,6 +653,8 @@ def _on_invite(pl, src, now):
                              "ip": src if d == "out" else "", "ans": None, "end": None}
     elif p["cseq"] != cseq and not p["done"]:
         p["t0"], p["cseq"], p["resp"] = now, cseq, False  # reintento con credenciales
+    elif src in LOCAL_IPS and p["cseq"] == cseq:
+        p["fwd"] = dst  # siguiente salto: FS en salientes, ONT/softphone en entrantes
 
 
 def _on_reply(pl, src, dst, now):
@@ -644,18 +678,25 @@ def _on_reply(pl, src, dst, now):
     except ValueError:
         return
     p["resp"] = True
+    if c >= 300:  # negativa generada por el proxy (sin una previa del siguiente salto) -> su ACK se absorbe
+        if src not in LOCAL_IPS:
+            p["neg_remote"] = True
+        elif not p.get("neg_remote"):
+            p["neg_local"] = p["cseq"].split()[0]
     m = sip_meta.get(cid)
     if c in (180, 183) or 200 <= c < 300:
         if not p["rang"]:
             p["rang"] = True
-            pdd["res"].append((now, now - p["t0"], p["dir"]))
+            mm = m or {}
+            pdd["res"].append((now, now - p["t0"], p["dir"], mm.get("from", ""), mm.get("to", ""),
+                               src if src not in LOCAL_IPS else p.get("fwd", "")))
         if m and m["dir"] == "in" and not m["ua"] and src not in LOCAL_IPS and src not in PDD_CORE_IPS:
             m["ua"] = (h.get("user-agent") or h.get("server") or "")[:80]  # ONT / softphone
             m["ip"] = src
     if c < 200 or c in (401, 407):
         return
     p["done"], p["tdone"] = True, now
-    pdd["final"].append((now, c, p["dir"], p["rang"]))
+    pdd["final"].append((now, c, p["dir"], p["rang"], src if src not in LOCAL_IPS else "proxy"))
     if m:
         if c < 300:
             m["ans"] = now
@@ -670,6 +711,38 @@ def _on_bye(pl, now):
         pdd["acd"].append((now, now - m["ans"], m["dir"]))
 
 
+def _req_key(pl):
+    hdr_end = pl.find(b"\r\n\r\n")
+    end = hdr_end if hdr_end > 0 else len(pl)
+    mc, ms = _CID.search(pl, 0, end), _CSEQN.search(pl, 0, end)
+    return (mc.group(1), ms.group(1)) if mc and ms else None
+
+
+def _track_silent(pl, src, dst, now):
+    """Peticion recibida por el proxy sin ninguna salida (respuesta o reenvio) con su
+    Call-ID+CSeq en SILENT_AFTER s y retransmitida por el cliente = ignorada (drop, exit sin
+    respuesta, pike...). Exigir la retransmision descarta los paquetes que pierde la propia sonda."""
+    if src in LOCAL_IPS:
+        k = _req_key(pl)
+        if k:
+            sec["rq"].pop(k, None)
+    elif dst in LOCAL_IPS and pl[:1].isalpha() and not pl.startswith(b"SIP/2.0 "):  # solo peticiones
+        if pl.startswith(b"ACK "):
+            k = _req_key(pl)
+            p = pdd["pend"].get(k[0].decode("latin-1")) if k else None
+            if p and p.get("neg_local") == k[1].decode():
+                sec["ack_abs"].append(now)  # ACK a 401/407/403... del proxy: sl lo descarta (drop)
+            return
+        k = _req_key(pl)
+        if not k:
+            return
+        v = sec["rq"].get(k)
+        if v:
+            v[4] += 1  # retransmision UDP: el cliente no recibio nada
+        else:
+            sec["rq"][k] = [now, pl[:pl.find(b" ")].decode("latin-1")[:16], src, pl[:2048], 1]
+
+
 def _pdd_capture(sock):
     last_gc = time.time()
     while True:
@@ -680,18 +753,20 @@ def _pdd_capture(sock):
         now = time.time()
         if now - last_gc > 5:
             last_gc = now
+            pdd["kdrops"] = pdd.get("kdrops", 0) + _pkt_drops(sock)
             _pdd_gc(now)
         if len(fr) < 42 or fr[12:14] != b"\x08\x00":
             continue
         pdd["pkts"] += 1
         ihl = (fr[14] & 15) * 4
         pl = fr[14 + ihl + 8:]
-        src = socket.inet_ntoa(fr[26:30])
+        src, dst = socket.inet_ntoa(fr[26:30]), socket.inet_ntoa(fr[30:34])
+        _track_silent(pl, src, dst, now)
         if pl.startswith(b"SIP/2.0 "):
-            _on_reply(pl, src, socket.inet_ntoa(fr[30:34]), now)
+            _on_reply(pl, src, dst, now)
             continue
         if pl.startswith(b"INVITE "):
-            _on_invite(pl, src, now)
+            _on_invite(pl, src, dst, now)
         elif pl.startswith(b"BYE "):
             _on_bye(pl, now)
         if src in sec["ua"]:  # UA del ofensor (solo IPs que ya recibieron 403)
@@ -713,7 +788,12 @@ def pdd_stats(now, window=KPI_WINDOW):
     res = [r for r in list(pdd["res"]) if now - r[0] <= window]
     nr = [r for r in list(pdd["noresp"]) if now - r[0] <= window]
     return {"status": pdd["status"], "error": pdd["error"], "pending": len(pdd["pend"]),
+            "pkts": pdd["pkts"], "kdrops": pdd.get("kdrops", 0),
             "out": _summ([r[1] for r in res if r[2] == "out"]),
+            # llamadas mas lentas: quien llama, a que numero y que salto dio el ringback
+            "slow": {d: [{"pdd": round(r[1], 2), "from": r[3], "to": r[4], "peer": r[5]}
+                         for r in sorted((r for r in res if r[2] == d), key=lambda r: -r[1])[:5]]
+                     for d in ("out", "in")},
             "in": _summ([r[1] for r in res if r[2] == "in"]),
             "noresp_out": sum(1 for r in nr if r[1] == "out"),
             "noresp_in": sum(1 for r in nr if r[1] == "in")}
@@ -738,21 +818,51 @@ def outcome_stats(now, window=KPI_WINDOW):
     nr = [r for r in list(pdd["noresp"]) if now - r[0] <= window]
     cats = {k: [0, 0] for k in OUTCOME_ORDER}
     net = {"5xx": 0, "408": 0, "noresp": len(nr)}
-    for _, c, d, rang in fin:
+    peers = {"5xx": Counter(), "408": Counter(), "noresp": Counter()}  # quien falla
+    for _, c, d, rang, peer in fin:
         cats[_outcome_cat(c)][d == "in"] += 1
         if 500 <= c < 600:
             net["5xx"] += 1
+            peers["5xx"][(peer, c)] += 1
         elif c == 408 and not rang:  # 408 tras timbrar = no contesta (causa de usuario)
             net["408"] += 1
-    for _, d in nr:
+            peers["408"][(peer, c)] += 1
+    for _, d, fwd in nr:
         cats["sin respuesta"][d == "in"] += 1
+        peers["noresp"][(fwd or "?", d)] += 1
     total = len(fin) + len(nr)
     nf = sum(net.values())
     return {"window_s": window, "total": total, "net_fail": net,
+            "net_peers": {k: [{"peer": p, "code": x, "n": n} for (p, x), n in v.most_common(5)]
+                          for k, v in peers.items()},
             "ner": round(100.0 * (1 - nf / total), 2) if total else None,
             "cats": [{"k": k, "out": v[0], "in": v[1], "n": v[0] + v[1],
                       "pct": round(100.0 * (v[0] + v[1]) / total, 1) if total else 0}
                      for k, v in cats.items() if v[0] + v[1]]}
+
+
+def _peer_txt(outcomes, kind):
+    """' · peer 10.0.0.4 (FS) 503 x7, ...' para el texto de una alarma de llamadas."""
+    lst = (outcomes.get("net_peers") or {}).get(kind) or []
+    if not lst:
+        return ""
+    def name(p):
+        return f"{p} (core)" if p in PDD_CORE_IPS else p
+    if kind == "noresp":
+        return " · reenviados a " + ", ".join(
+            f"{name(x['peer'])} {'sal' if x['code'] == 'out' else 'ent'} ×{x['n']}" for x in lst[:3])
+    return " · origen " + ", ".join(f"{name(x['peer'])} {x['code']} ×{x['n']}" for x in lst[:3])
+
+
+def _slow_txt(pdd_info, d, n=3):
+    """' · más lentas: 7.0 s 19001234→987654321 vía 10.0.0.4 (core), ...'"""
+    lst = (pdd_info.get("slow") or {}).get(d) or []
+    if not lst:
+        return ""
+    def one(x):
+        peer = f"{x['peer']} (core)" if x["peer"] in PDD_CORE_IPS else x["peer"]
+        return f"{x['pdd']:.1f} s {x['from'] or '?'}→{x['to'] or '?'}" + (f" vía {peer}" if peer else "")
+    return " · más lentas: " + ", ".join(one(x) for x in lst[:n])
 
 
 def acd_stats(now, window=900):
@@ -784,6 +894,26 @@ def banned_ips(now):
     return _ban
 
 
+def silent_stats(now, window=KPI_WINDOW, top=8):
+    rows = [r for r in list(sec["silent"]) if now - r[0] <= window + SILENT_AFTER]
+    span = max(1, min(window, now - SILENT_AFTER - (pdd["since"] or now)))
+    ips, meths, ip_meth, ip_user, ip_ua = Counter(), Counter(), {}, {}, {}
+    for _, meth, ip, user, ua in rows:
+        ips[ip] += 1
+        meths[meth] += 1
+        ip_meth.setdefault(ip, Counter())[meth] += 1
+        if user:
+            ip_user.setdefault(ip, Counter())[user] += 1
+        if ua:
+            ip_ua[ip] = ua
+    n = len(rows)
+    return {"window_s": window, "total": n, "rate": round(n / span, 2), "unique_ips": len(ips),
+            "methods": dict(meths.most_common()),
+            "top": [{"ip": ip, "n": c, "pct": round(100.0 * c / n, 1), "meth": ip_meth[ip].most_common(1)[0][0],
+                     "user": ip_user[ip].most_common(1)[0][0] if ip in ip_user else "",
+                     "ua": ip_ua.get(ip, "")} for ip, c in ips.most_common(top)]}
+
+
 def security_stats(now, window=900, top=10):
     if _sec_cache["out"] and now - _sec_cache["ts"] < 10:
         return _sec_cache["out"]
@@ -808,6 +938,8 @@ def security_stats(now, window=900, top=10):
     out = {"window_s": window, "span_s": int(span), "total": n, "rate": round(n / span, 2),
            "unique_ips": len(ips), "methods": dict(meths.most_common()),
            "ipban_n": len(ban["ipban"]), "f2b_n": len(ban["f2b"]), "f2b_jails": ban["jails"],
+           "silent": silent_stats(now), "ack_abs_rate": round(
+               sum(1 for t in list(sec["ack_abs"]) if now - t <= 60) / max(1, min(60, span)), 2),
            "top_ips": [{"ip": ip, "n": c, "pct": round(100.0 * c / n, 1), "ua": uas.get(ip, ""),
                         "user": ip_user[ip].most_common(1)[0][0] if ip in ip_user else "",
                         "users": len(ip_user.get(ip, ())), "meth": ip_meth[ip].most_common(1)[0][0],
@@ -1104,7 +1236,7 @@ def window_kpis(now, stats, calls, registered):
         att = d["dialog:processed_dialogs"]
         ans = max(0, att - d["dialog:failed_dialogs"])
         kpi.update(window_s=int(dt), attempts=att, answered=ans,
-                   cps=round(att / dt, 3))
+                   cps=round(att / dt, 3), drop_ps=round(d["core:drop_requests"] / dt, 2))
         if att > 0:
             kpi["asr"] = round(100.0 * min(ans, att) / att, 1)
             # NER: excluye causas de usuario (busy/no answer/cancel/decline); solo 5xx = red
@@ -1265,7 +1397,7 @@ def alarms_update(alerts, now):
     with alarms["lock"]:
         seen = set()
         for a in alerts:
-            k = alarm_key(a["msg"])
+            k = a.get("key") or alarm_key(a["msg"])
             seen.add(k)
             r = act.get(k)
             if r is None:
@@ -1777,9 +1909,22 @@ def collect_once():
     elif shm_pct >= 70:
         alerts.append({"sev": "minor", "msg": f"SHM al {shm_pct}% — vigilar crecimiento"})
     if rates.get("rpl_5xx", 0) > 0.5:
-        alerts.append({"sev": "major", "msg": f"Errores 5xx sostenidos: {rates['rpl_5xx']}/s"})
-    if rates.get("drop_req", 0) > 1:
-        alerts.append({"sev": "minor", "msg": f"Requests dropeados: {rates['drop_req']}/s (posible pike/antiflood)"})
+        alerts.append({"sev": "major", "key": "5xx-sostenidos",
+                       "msg": f"Errores 5xx sostenidos: {rates['rpl_5xx']}/s" + _peer_txt(outcomes, "5xx")})
+    if (kpi.get("drop_ps") or 0) > 1:  # promedio 5 min: el valor cada 2 s oscila en el umbral
+        if pdd_info["status"] != "running":  # sin sonda no se puede atribuir: aviso generico
+            alerts.append({"sev": "minor", "key": "drop-requests",
+                           "msg": f"core:drop_requests {kpi['drop_ps']}/s (pike/antiflood, drop() o ACK a "
+                                  "respuestas sin estado 401/407; activar la sonda SIP para ver el origen)"})
+    sil = snap["security"]["silent"]
+    if pdd_info["status"] == "running" and sil["rate"] >= 1 and sil["top"]:
+        t = sil["top"][0]
+        meths = ", ".join(f"{m} {n}" for m, n in list(sil["methods"].items())[:3])
+        alerts.append({"sev": "minor", "key": "peticiones-ignoradas",
+                       "msg": f"Peticiones ignoradas sin respuesta ni reenvío: {sil['rate']}/s en 5 min "
+                              f"({meths}; {sil['unique_ips']} IPs) · principal {t['ip']} {t['pct']}% "
+                              f"{t['meth']}" + (f" usuario {t['user']}" if t["user"] else "")
+                              + (f" UA \"{t['ua']}\"" if t["ua"] else "")})
     # RTPEngine
     rtp = snap.get("rtpengine", {})
     if rtp.get("status") == "n/a":
@@ -1844,20 +1989,27 @@ def collect_once():
     if (kpi.get("ner_n") or 0) >= 20 and kpi["ner"] is not None and kpi["ner"] < 95:
         nf = outcomes["net_fail"]
         why = (f"5xx {nf['5xx']} · 408 {nf['408']} · sin respuesta {nf['noresp']}"
+               + _peer_txt(outcomes, max(nf, key=nf.get))
                if kpi["ner_src"] == "carrier" else "fallos 5xx")
         alerts.append({"sev": "major" if kpi["ner"] < 90 else "minor",
-                       "msg": f"NER degradado: {kpi['ner']}% — {why}"})
+                       "key": "ner-degradado", "msg": f"NER degradado: {kpi['ner']}% — {why}"})
     po, pi = pdd_info["out"], pdd_info["in"]
     if pdd_info["status"] == "error":
         alerts.append({"sev": "minor", "msg": f"Medición PDD detenida: {pdd_info['error']}"})
     if po["n"] >= 10 and po["p95"] > 5:
-        alerts.append({"sev": "major", "msg": f"PDD saliente p95 {po['p95']:.1f} s (umbral 5 s, {po['n']} llamadas)"})
+        alerts.append({"sev": "major", "key": "pdd-out-p95",
+                       "msg": f"PDD saliente p95 {po['p95']:.1f} s (umbral 5 s, {po['n']} llamadas)" + _slow_txt(pdd_info, "out")})
     elif po["n"] >= 10 and po["avg"] > 3:
-        alerts.append({"sev": "minor", "msg": f"PDD saliente promedio {po['avg']:.1f} s (umbral 3 s)"})
+        alerts.append({"sev": "minor", "key": "pdd-out-avg",
+                       "msg": f"PDD saliente promedio {po['avg']:.1f} s (umbral 3 s)" + _slow_txt(pdd_info, "out")})
     if pi["n"] >= 10 and pi["avg"] > 2:
-        alerts.append({"sev": "minor", "msg": f"PDD entrante promedio {pi['avg']:.1f} s — ONT/softphones lentos en timbrar"})
+        alerts.append({"sev": "minor", "key": "pdd-in-avg",
+                       "msg": f"PDD entrante promedio {pi['avg']:.1f} s — ONT/softphones lentos en timbrar"
+                              + _slow_txt(pdd_info, "in")})
     if pdd_info["noresp_out"] + pdd_info["noresp_in"] >= 5:
-        alerts.append({"sev": "minor", "msg": f"INVITE sin respuesta (32 s): {pdd_info['noresp_out']} salientes, {pdd_info['noresp_in']} entrantes en 5 min"})
+        alerts.append({"sev": "minor", "key": "invite-sin-respuesta",
+                       "msg": f"INVITE sin respuesta (32 s): {pdd_info['noresp_out']} salientes, "
+                              f"{pdd_info['noresp_in']} entrantes en 5 min" + _peer_txt(outcomes, "noresp")})
     if kpi.get("reg_ok_pct") is not None and kpi["reg_ok_pct"] < 95:
         alerts.append({"sev": "minor", "msg": f"Tasa de registro exitoso {kpi['reg_ok_pct']}%"})
     snap["status"] = "critical" if any(a["sev"] == "critical" for a in alerts) else \

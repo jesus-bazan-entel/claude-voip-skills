@@ -92,5 +92,8 @@ Ejecutar en el proxy destino (root). Rutas relativas al directorio de este skill
   si la historia es más corta.
 - RSS de Kamailio cuenta la SHM ×N procesos (7 GB falsos con 144 procs): usar PSS.
 - Alarmas en el servidor (no en el navegador): sobreviven a recargas y cambios de turno.
+- `core:drop_requests` incluye los ACK a 401/407 que `sl` absorbe: no alarmar sobre él con la
+  sonda activa; usar "peticiones ignoradas" (exige retransmisión del cliente).
+- Toda alarma de llamadas debe nombrar el origen/peer (IP, número, salto); si no, no es accionable.
 - Los 403 no implican ataque: en un despliegue real eran ~1.100 ONT con 1 usuario por IP (cuentas
   restringidas en el registrar). Mirar Top usuarios/UA antes de bloquear IPs.

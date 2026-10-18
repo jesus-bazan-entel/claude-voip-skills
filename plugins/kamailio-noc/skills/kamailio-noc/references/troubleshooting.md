@@ -20,6 +20,8 @@
 | "INVITE no capturado" en tablas de llamadas | la llamada empezó antes de arrancar la sonda | desaparece solo |
 | ACD muy bajo tras reiniciar | sólo se miden llamadas contestadas después del arranque | esperar ~15 min |
 | Alarma que se abre y cierra seguido | métrica oscilando en el umbral | histéresis de 60 s; revisar umbral |
+| `core:drop_requests` alto sin ataque | ACK a 401/407 que `sl` absorbe (normal) | ver "ACK a 401/407 absorbidos" en el panel de seguridad |
+| "Peticiones ignoradas" con 1 petición por IP | antes de exigir retransmisión: pérdida de la sonda | ya corregido; revisar "pkt perdidos" en Sonda PDD |
 | Notificaciones no llegan | `notify` vacío o sin reiniciar; error en `journalctl -u kamailio-noc` ("notificacion fallida") | completar token/chat o webhook y reiniciar |
 | Dispatcher "DESHABILITADO POR CONFIG" | flags `D*` en `dispatcher.list` (sin sondeo) | no es caída; no cuenta en UP/total |
 | Cookie/login en bucle tras nginx | falta `X-Forwarded-Prefix /noc` o no es HTTPS | usar el snippet de `assets/nginx-noc.conf` |

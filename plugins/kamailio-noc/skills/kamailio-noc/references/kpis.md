@@ -41,6 +41,30 @@ max(10% de la media, 0.02) (CPS) para no alarmar por ruido. Al instalar se relle
   toma de las siguientes peticiones de esa IP. Top 10 IP/UA/usuario en 15 min, cruzado con
   `kamcmd htable.dump ipban` y `fail2ban-client status` (cada 30 s).
 
+## Peticiones ignoradas vs `core:drop_requests`
+
+`core:drop_requests` **no** indica ataque por sí solo: el módulo `sl` cuenta como drop cada ACK
+a una respuesta negativa sin estado (401/407 de autenticación digest, 403/404 con
+`sl_send_reply`). En un proxy con auth de INVITE es ~1 drop por llamada desafiada. Medido:
+19 drops en 60 s = 17 ACK a 407/401. El contador además no guarda el origen.
+
+Por eso, con la sonda activa, la alarma usa **peticiones ignoradas**: la petición llega al
+proxy, el cliente la **retransmite** y en 8 s no sale nada con su Call-ID+CSeq (ni respuesta ni
+reenvío). Exigir la retransmisión descarta los paquetes que pierde la propia sonda (sin eso
+salían ~0,7 REGISTER/s falsos). Alarma minor ≥1/s en 5 min con IP, método, usuario y UA
+principales. Los "ACK a 401/407 absorbidos" se muestran como explicación del contador.
+Sin sonda: alarma genérica sobre `drop_requests` promediado en 5 min (no cada 2 s, que oscila).
+
+Socket de captura con `SO_RCVBUFFORCE` 16 MB; las pérdidas del kernel (`PACKET_STATISTICS`)
+se muestran en "Sonda PDD".
+
+## Origen / peer en las alarmas de llamadas
+
+- 5xx sostenidos y NER: IP que generó la respuesta (o `proxy`) y código, top 3.
+- INVITE sin respuesta: IP a la que el proxy reenvió el INVITE (siguiente salto) y dirección.
+- PDD: las 3 llamadas más lentas con From → R-URI y el salto que dio el ringback.
+- Estas alarmas tienen clave fija (`key`), así el texto puede cambiar sin abrir otra alarma.
+
 ## Alarmas (tabla `alarms`, retención 30 días)
 
 Clave = mensaje con números normalizados. Alta inmediata; severidad sólo escala (escalar
